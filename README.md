@@ -22,7 +22,14 @@ engineering) вместо устаревших CNN-подходов «по ка�
 ```bash
 pip install -r requirements.txt
 
-# Демо: сгенерировать историю и прогнать холодный бэктест (TEST-режим)
+# РЕАЛЬНЫЕ данные Мосбиржи: скачать историю через публичный MOEX ISS API
+# (без ключей и регистрации) и сразу прогнать TEST-бэктест:
+python main.py --download --symbol SBER --timeframe 1h --days 90
+python main.py --download --symbol GAZP --timeframe 5m --days 20   # intraday глубина ISS ~30 дней
+
+# Если CSV по пути CONFIG.csv_path отсутствует — бот скачает реальные данные сам.
+
+# Демо: сгенерировать синтетическую историю и прогнать холодный бэктест
 python main.py --gen-data --timeframe 5m
 
 # Своя история (формат: datetime,open,high,low,close,volume)
@@ -31,10 +38,24 @@ python main.py --csv data/sber_5m.csv --symbol SBER --timeframe 5m
 # Только обучение + walk-forward отчёт
 python main.py --train-only --timeframe 15m
 
-# Боевой режим (ключи Finam через ENV)
+# Боевой режим (ключи Finam через ENV; свечи LIVE идут через Finam Trade API)
 export FNBOT_FINAM_CLIENT_ID=... FNBOT_FINAM_API_KEY=...
 python main.py --mode LIVE --timeframe 1h
 ```
+
+### Источники настоящих данных
+
+| Источник | Режим | Что даёт | Ключи |
+|---|---|---|---|
+| **MOEX ISS** (`iss.moex.com/iss`) | TEST / download | Реальные intraday-свечи 1m/5m/10m/15m/1h (~последние 30 дней, пагинация offset/start) + дневная история на годы вглубь | не нужны |
+| **Finam Trade API** (`api.open-api.finam.ru`) | LIVE | Свежие свечи, стакан, выставление ордеров | `FNBOT_FINAM_API_KEY` |
+
+Ограничение публичного ISS: intraday-свечи отдаются только за ~30 последних дней
+(≤500 баров на запрос). Для обеспечения минимальной истории обучения downloader
+автоматически догружает **дневные** бары из `history/...securities` (доступны на
+много лет назад), а торговый движок умеет bootstrap-обучение на уменьшенном окне.
+Для более глубокой intraday-истории используйте архивы Finam (LIVE-клиент уже
+умеет `candles/get` на произвольный период) или свой CSV.
 
 Поддерживаемые таймфреймы: `1m, 5m, 10m, 15m, 1h` — глубина истории, горизонт
 прогноза и таймаут удержания позиции адаптируются автоматически (см. `TF_PRESETS`).

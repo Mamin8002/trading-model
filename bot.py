@@ -105,13 +105,16 @@ class TradingEngine:
         tfp = self.cfg.tf
         need = max(tfp.min_history_bars, tfp.warmup_bars + tfp.lookback_bars + 500)
         if len(df_hist) < need:
-            # в LIVE разрешаем обучиться раньше (нет смысла ждать недели истории),
-            # но не ниже разумного минимума для устойчивой статистики индикаторов
-            live_min = tfp.warmup_bars + 600
-            if not (force and self.cfg.mode == "LIVE" and len(df_hist) >= live_min):
+            # bootstrap для реальных данных: публичные источники (MOEX ISS / Finam)
+            # дают ограниченный intraday-объём, поэтому разрешаем обучиться на
+            # уменьшенном окне — но не ниже статистически разумного минимума.
+            boot_min = tfp.warmup_bars + 600
+            if len(df_hist) >= boot_min:
+                log.warning("Bootstrap: обучение на уменьшенном окне (%d < %d баров, минимум %d)",
+                            len(df_hist), need, boot_min)
+            else:
                 log.warning("Истории мало (%d < %d баров) — обучение отложено", len(df_hist), need)
                 return
-            log.warning("LIVE bootstrap: обучение на уменьшенном окне (%d баров)", len(df_hist))
         X, y, feats = build_dataset(df_hist, horizon_bars=tfp.horizon_bars)
         if len(X) < 500:
             log.warning("Валидных обучающих строк мало (%d) — пропуск обучения", len(X))

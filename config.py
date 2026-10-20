@@ -35,6 +35,9 @@ TIMEFRAME_FINAM: dict[str, str] = {
     "1h": "H1",
 }
 
+# MOEX ISS interval (minutes) — used by the real-history downloader
+TIMEFRAME_MOEX: dict[str, int] = {tf: m for tf, m in TIMEFRAME_MINUTES.items()}
+
 
 def _tf_minutes(tf: str) -> int:
     if tf not in TIMEFRAME_MINUTES:
@@ -77,7 +80,7 @@ class BotConfig:
 
     # ------------------ Инструмент / данные ------------------
     symbol: str = os.getenv("FNBOT_SYMBOL", "SBER")        # тикер Мосбиржи
-    csv_path: str = os.getenv("FNBOT_CSV_PATH", "data/sber_5m.csv")  # история для TEST-режима
+    csv_path: str = os.getenv("FNBOT_CSV_PATH", "data/SBER_5m_moex.csv")  # история для TEST-режима
     live_history_days: int = int(os.getenv("FNBOT_LIVE_HISTORY_DAYS", "60"))
 
     # ------------------ Капитал и риск ------------------
@@ -116,6 +119,11 @@ class BotConfig:
     finam_base_url: str = os.getenv("FNBOT_FINAM_BASE_URL", "https://api.open-api.finam.ru")
     finam_market_name: str = os.getenv("FNBOT_FINAM_MARKET", "MOEX")   # рынок
     finam_exchange: str = os.getenv("FNBOT_FINAM_EXCHANGE", "TSBS")    # TSBS — основная площадка TIS
+
+    # ------------------ Реальная история Мосбиржи (ISS, без ключей) ------------------
+    moex_board: str = os.getenv("FNBOT_MOEX_BOARD", "TQBR")            # TQBR — акции основного рынка
+    moex_base_url: str = os.getenv("FNBOT_MOEX_BASE_URL", "https://iss.moex.com/iss")
+    download_days: int = int(os.getenv("FNBOT_DOWNLOAD_DAYS", "90"))   # глубина загрузки intraday-свечей
 
     def validate(self) -> None:
         _tf_minutes(self.timeframe)  # падает, если ТФ неизвестен

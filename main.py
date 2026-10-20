@@ -2,10 +2,14 @@
 main.py — Точка входа: инициализация логирования, разбор CLI/ENV, запуск бота.
 
 Использование:
-    python main.py                          # TEST-режим (бэктест по CSV)
-    python main.py --gen-data               # сгенерировать демо-историю и запустить тест
-    python main.py --mode LIVE              # боевой режим (нужны ключи Finam в ENV)
-    python main.py --timeframe 15m          # переопределить ТФ
+    python main.py --download                 # скачать РЕАЛЬНУЮ историю Мосбиржи (MOEX ISS)
+                                              # в CONFIG.csv_path и запустить TEST-бэктест
+    python main.py --download --days 30 --symbol GAZP --timeframe 15m
+    python main.py                            # TEST-режим (бэктест по CSV; если файла нет —
+                                              # реальные данные скачаются автоматически)
+    python main.py --gen-data                 # сгенерировать синтетическую демо-историю
+    python main.py --mode LIVE                # боевой режим (нужны ключи Finam в ENV)
+    python main.py --timeframe 15m            # переопределить ТФ
     python main.py --symbol GAZP --csv data/gazp_15m.csv
 """
 from __future__ import annotations
@@ -46,7 +50,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--risk", dest="risk_pct", type=float, default=None, help="риск на сделку, %")
     p.add_argument("--log-level", default="INFO")
     p.add_argument("--gen-data", action="store_true",
-                   help="сгенерировать синтетическую историю в CONFIG.csv_path и выйти? нет — затем запустить")
+                   help="сгенерировать синтетическую историю в CONFIG.csv_path и затем запустить")
+    p.add_argument("--download", action="store_true",
+                   help="скачать РЕАЛЬНУЮ историю Мосбиржи (MOEX ISS) в CONFIG.csv_path и затем запустить")
+    p.add_argument("--days", type=int, default=None,
+                   help="глубина загрузки реальной истории в календарных днях (по умолчанию 90)")
     p.add_argument("--train-only", action="store_true",
                    help="только обучить модель и вывести walk-forward метрики (без торговли)")
     return p.parse_args()
@@ -103,7 +111,13 @@ async def amain() -> None:
     log.info("Config: %s", cfg.to_dict())
     log.info("=" * 72)
 
-    if args.gen_data:
+    if args.gen_data and args.download:
+        raise SystemExit("--gen-data и --download взаимоисключающие")
+
+    if args.download:
+        from data_loader import download_moex_history
+        await download_moex_history(cfg, days=args.days)
+    elif args.gen_data:
         from data_loader import generate_synthetic_csv
         generate_synthetic_csv(cfg.csv_path, n_bars=max(cfg.tf.min_history_bars + 2000, 6000),
                                tf_minutes=TIMEFRAME_MINUTES[cfg.timeframe],

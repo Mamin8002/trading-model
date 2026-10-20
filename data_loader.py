@@ -12,10 +12,11 @@ datetime, open, high, low, close, volume, отсортированные по в
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 from abc import ABC, abstractmethod
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
 import numpy as np
@@ -81,13 +82,13 @@ class CsvDataLoader(BaseDataLoader):
         self._df: Optional[pd.DataFrame] = None
         self._cursor = 0  # для пошаговой "live-имитации" в бэктесте
 
-    def _load(self) -> pd.DataFrame:
+    async def _load_async(self) -> pd.DataFrame:
+        """Ленивая загрузка; если CSV нет — автоматически качаем реальные данные MOEX ISS."""
         if self._df is None:
             if not os.path.exists(self.csv_path):
-                raise FileNotFoundError(
-                    f"CSV с историей не найден: {self.csv_path}. "
-                    f"Скачайте данные или сгенерируйте синтетику: python main.py --gen-data"
-                )
+                log.info("CSV %s не найден — скачиваю РЕАЛЬНУЮ историю Мосбиржи (MOEX ISS)...",
+                         self.csv_path)
+                await download_moex_history(self.cfg, out_path=self.csv_path)
             raw = pd.read_csv(self.csv_path)
             self._df = normalize_ohlcv(raw)
             log.info("Загружено %d баров из %s (%s ... %s)",
@@ -95,8 +96,14 @@ class CsvDataLoader(BaseDataLoader):
                      self._df['datetime'].iloc[0], self._df['datetime'].iloc[-1])
         return self._df
 
+    def _load(self) -> pd.DataFrame:
+        if self._df is None:
+            raise RuntimeError("CsvDataLoader: используйте await loader.fetch_history() "
+                               "(первая загрузка может скачать реальные данные MOEX)")
+        return self._df
+
     async def fetch_history(self, n_bars: Optional[int] = None) -> pd.DataFrame:
-        df = self._load()
+        df = await self._load_async()
         if n_bars is not None:
             # эмулируем "окно свежих данных" относительно текущего курсора
             end = self._cursor if self._cursor > 0 else len(df)
@@ -152,6 +159,217 @@ def generate_synthetic_csv(path: str, n_bars: int = 8000, tf_minutes: int = 5,
     df.to_csv(path, index=False)
     log.info("Синтетическая история сохранена: %s (%d баров)", path, n_bars)
     return df
+
+
+# ---------------------------------------------------------------------------
+# Реальная история Мосбиржи: MOEX ISS (бесплатный публичный API, без ключей)
+# ---------------------------------------------------------------------------
+# Ограничения публичных свечей ISS: не более 500 баров за запрос и примерно
+# последние ~30 календарных дней для intraday. Поэтому используется стратегия:
+#   * 1h    — окна по ~28 дней, одно HTTP-окно = 300-470 часовых баров;
+#   * <=15m — сначала дневные OHLC (D1) для определения торговых дат,
+#             затем посезонная/посуточная загрузка с шагом offset=500 внутри дня.
+MOEX_CANDLES_URL = "{base}/engines/stock/markets/shares/boards/{board}/securities/{symbol}/candles.json"
+MOEX_DAILY_URL = "{base}/history/engines/stock/markets/shares/securities/{symbol}.json"
+
+
+async def _http_get_json(session, url: str, params: dict, retries: int = 4) -> dict:
+    """GET c ретраями и троттлингом (ISS отдаёт HTML-заглушку при перегрузке)."""
+    import aiohttp
+    delay = 1.0
+    last_err: Exception | None = None
+    for attempt in range(retries):
+        try:
+            async with session.get(url, params=params) as resp:
+                if resp.status == 429:
+                    raise RuntimeError("ISS 429 (rate limit)")
+                if resp.status != 200:
+                    raise RuntimeError(f"ISS HTTP {resp.status}")
+                text = await resp.text()
+                if not text.lstrip().startswith(("{", "[")):
+                    raise RuntimeError("ISS вернул не-JSON (перегрузка/блокировка)")
+                return json.loads(text)
+        except Exception as e:  # noqa: BLE001 — network layer, retry everything
+            last_err = e
+            if attempt < retries - 1:
+                log.debug("ISS retry %d (%s): %s", attempt + 1, url.split("?")[0], e)
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 20)
+    raise RuntimeError(f"MOEX ISS недоступен: {url} ({last_err})")
+
+
+def _candles_to_df(payload: dict) -> pd.DataFrame:
+    """candles.json -> канонический OHLCV (время баров MOEX — MSK)."""
+    c = payload.get("candles") or {}
+    cols, data = c.get("columns") or [], c.get("data") or []
+    if not data:
+        return pd.DataFrame(columns=REQUIRED_COLS)
+    df = pd.DataFrame(data, columns=cols)
+    df = df.rename(columns={"begin": "datetime"})
+    df = df[["datetime", "open", "high", "low", "close", "volume"]]
+    msk = timezone(timedelta(hours=3))
+    df["datetime"] = pd.to_datetime(df["datetime"]).dt.tz_localize(msk)
+    return normalize_ohlcv(df)
+
+
+async def moex_fetch_intraday(symbol: str, tf_minutes: int, date_from: date, date_to: date,
+                             board: str = "TQBR", base_url: str = "https://iss.moex.com/iss",
+                             session=None, max_frames: int = 60) -> pd.DataFrame:
+    """Загрузка реальных intraday-свечей с MOEX ISS (1/5/10/15/60 минут)."""
+    import aiohttp
+    own = session is None
+    sess = session or aiohttp.ClientSession()
+    url = MOEX_CANDLES_URL.format(base=base_url, board=board, symbol=symbol)
+    frames: list[pd.DataFrame] = []
+    # ISS отдаёт intraday только за ~30 последних дней — не просим больше
+    earliest = datetime.now(timezone(timedelta(hours=3))).date() - timedelta(days=28)
+    if date_from < earliest:
+        log.info("ISS: intraday ограничена ~30 днями — сдвигаю начало %s -> %s", date_from, earliest)
+        date_from = earliest
+    try:
+        # --- часовики: окна по ~28 дней, пагинация start ---
+        if tf_minutes >= 60:
+            w_from = date_from
+            while w_from <= date_to:
+                w_to = min(date_to, w_from + timedelta(days=27))
+                start = 0
+                for _ in range(max_frames):
+                    try:
+                        data = await _http_get_json(sess, url, {
+                            "from": w_from.isoformat(), "to": w_to.isoformat(),
+                            "interval": tf_minutes, "start": start})
+                    except RuntimeError as e:
+                        if w_from < earliest and "не-JSON" not in str(e):
+                            break  # слишком глубокий период — остальное догрузим суточными запросами
+                        raise
+                    df = _candles_to_df(data)
+                    if df.empty:
+                        break
+                    frames.append(df)
+                    total = (data.get("candles") or {}).get("metadata", {}).get("total", 0)
+                    start += len(df)
+                    if start >= total:
+                        break
+                    await asyncio.sleep(0.15)
+                w_from = w_to + timedelta(days=1)
+        else:
+            # --- низкие ТФ: торговые даты берём из дневной истории ---
+            daily = await moex_fetch_daily(symbol, date_from, date_to, base_url=base_url,
+                                           session=sess)
+            trade_days = [d.date() for d in daily["datetime"]] if not daily.empty else \
+                [date_from + timedelta(days=i) for i in range((date_to - date_from).days + 1)]
+            for day in trade_days:
+                if day < earliest:
+                    continue  # ISS не хранит intraday так глубоко
+                offset = 0
+                got_day = False
+                for _ in range(8):  # максимум ~11 часов торговли по 500*tf минут
+                    data = await _http_get_json(sess, url, {
+                        "from": day.isoformat(), "to": day.isoformat(),
+                        "interval": tf_minutes, "offset": offset})
+                    df = _candles_to_df(data)
+                    if df.empty:
+                        break
+                    frames.append(df)
+                    got_day = True
+                    offset += len(df)
+                    await asyncio.sleep(0.15)
+                if not got_day:
+                    continue
+    finally:
+        if own:
+            await sess.close()
+    if not frames:
+        raise RuntimeError(
+            f"MOEX ISS: нет intraday-свечей {symbol} tf={tf_minutes}m за {date_from}..{date_to}. "
+            f"Публичные intraday-данные ISS доступны только ~30 дней назад — уменьшите период.")
+    out = pd.concat(frames, ignore_index=True)
+    out = normalize_ohlcv(out)
+    # защита от дублей окон: оставляем уникальные метки времени
+    out = out.drop_duplicates(subset="datetime").reset_index(drop=True)
+    return out
+
+
+async def moex_fetch_daily(symbol: str, date_from: date, date_to: date,
+                           base_url: str = "https://iss.moex.com/iss",
+                           session=None) -> pd.DataFrame:
+    """Дневная история MOEX (OHLCV по торговым дням) — доступна на годы вглубь."""
+    import aiohttp
+    own = session is None
+    sess = session or aiohttp.ClientSession()
+    url = MOEX_DAILY_URL.format(base=base_url, symbol=symbol)
+    rows: list[dict] = []
+    start = 0
+    try:
+        for _ in range(100):
+            data = await _http_get_json(sess, url, {
+                "from": date_from.isoformat(), "to": date_to.isoformat(), "start": start})
+            h = data.get("history") or {}
+            cols, chunk = h.get("columns") or [], h.get("data") or []
+            if not chunk:
+                break
+            for r in chunk:
+                rec = dict(zip(cols, r))
+                rows.append({
+                    "datetime": rec["TRADEDATE"], "open": rec.get("OPEN"),
+                    "high": rec.get("HIGH"), "low": rec.get("LOW"),
+                    "close": rec.get("CLOSE"), "volume": rec.get("VOLUME"),
+                })
+            total = h.get("metadata", {}).get("total", 0)
+            start += len(chunk)
+            if start >= total:
+                break
+            await asyncio.sleep(0.15)
+    finally:
+        if own:
+            await sess.close()
+    if not rows:
+        return pd.DataFrame(columns=REQUIRED_COLS)
+    df = pd.DataFrame(rows)
+    msk = timezone(timedelta(hours=3))
+    df["datetime"] = pd.to_datetime(df["datetime"]).dt.tz_localize(msk)
+    return normalize_ohlcv(df)
+
+
+async def download_moex_history(cfg: BotConfig, days: Optional[int] = None,
+                                out_path: Optional[str] = None) -> str:
+    """
+    Скачивает НАСТОЯЩУЮ историю Мосбиржи и сохраняет CSV формата
+    datetime,open,high,low,close,volume. Возвращает путь к файлу.
+
+    * 1h и ниже — через candles.json (intraday, глубина публичного API ~30 дней);
+    * при нехватке intraday автоматически догружает ДНЕВНЫЕ бары, чтобы модели
+      хватило истории для обучения (min_history_bars).
+    """
+    import aiohttp
+    tf_min = _tf_minutes(cfg.timeframe)
+    days = days or cfg.download_days
+    today = datetime.now(timezone(timedelta(hours=3))).date()  # MSK
+    date_to, date_from = today, today - timedelta(days=days)
+    path = out_path or cfg.csv_path
+    log.info("MOEX ISS: скачиваю РЕАЛЬНУЮ историю %s tf=%s, %s .. %s (board=%s)",
+             cfg.symbol, cfg.timeframe, date_from, date_to, cfg.moex_board)
+    async with aiohttp.ClientSession() as sess:
+        df = await moex_fetch_intraday(cfg.symbol, tf_min, date_from, date_to,
+                                       board=cfg.moex_board, base_url=cfg.moex_base_url,
+                                       session=sess)
+        need = cfg.tf.min_history_bars
+        if len(df) < need:
+            extra_days = max(400, int((need - len(df)) / 230) + 60)  # ~230 D1-баров/год
+            log.info("Intraday-барров мало для обучения (%d < %d) — догружаю дневную историю %d дн.",
+                     len(df), need, extra_days)
+            daily = await moex_fetch_daily(cfg.symbol, today - timedelta(days=extra_days),
+                                           date_from - timedelta(days=1),
+                                           base_url=cfg.moex_base_url, session=sess)
+            if not daily.empty:
+                df = normalize_ohlcv(pd.concat([daily, df], ignore_index=True))
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    save = df.copy()
+    save["datetime"] = save["datetime"].dt.strftime("%Y-%m-%d %H:%M:%S")
+    save.to_csv(path, index=False)
+    log.info("Сохранено %d реальных баров -> %s (%s ... %s)",
+             len(df), path, df['datetime'].iloc[0], df['datetime'].iloc[-1])
+    return path
 
 
 # ---------------------------------------------------------------------------
