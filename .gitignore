@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+logs/
+models/
+data/*.csv
+.env
