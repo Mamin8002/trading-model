@@ -66,6 +66,16 @@ class ModelCfg:
     horizon_bars: int = 1
     confidence_threshold: float = 0.55
     random_seed: int = 42
+    # "auto" - сравнить raw и ratio в walk-forward и выбрать лучший (фиксируется в model_card);
+    # "raw"  - признаки как в исходном ноутбуке (сырые OHLCV+turnover);
+    # "ratio"- минимально необходимая модификация: цены относительно close бара (стационарнее).
+    feature_set: str = "auto"
+    # гиперпараметры XGBoost (дефолты как в исходном ноутбуке)
+    n_estimators: int = 100
+    max_depth: int = 6
+    learning_rate: float = 0.3
+    # каталог артефакта модели; None - брать последний по дате из data.models_dir
+    artifact_dir: Optional[str] = None
 
     @property
     def horizon_minutes(self) -> int:
@@ -126,6 +136,10 @@ class AppConfig:
             raise ConfigError("model.horizon_bars должен быть целым >= 1")
         if not (0.5 < self.model.confidence_threshold <= 1.0):
             raise ConfigError("model.confidence_threshold должен быть в (0.5, 1.0]")
+        if self.model.feature_set not in ("auto", "raw", "ratio"):
+            raise ConfigError("model.feature_set должен быть auto|raw|ratio")
+        if self.model.n_estimators < 1 or self.model.max_depth < 1 or self.model.learning_rate <= 0:
+            raise ConfigError("model.n_estimators/max_depth/learning_rate должны быть положительными")
         if self.signals.stale_after_intervals < 1:
             raise ConfigError("signals.stale_after_intervals должен быть >= 1")
         if self.model.algorithm not in ("xgboost",):

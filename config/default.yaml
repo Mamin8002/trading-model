@@ -22,6 +22,11 @@ model:
   horizon_bars: 1          # на сколько баров вперёд смотреть (1 бар = 5 минут при interval=5)
   confidence_threshold: 0.55   # ниже порога -> HOLD/воздержание от рекомендации
   random_seed: 42
+  feature_set: auto        # auto | raw (как в оригинальном ноутбуке) | ratio (цены относительно close)
+  n_estimators: 100        # дефолты XGBoost, как в исходном ноутбуке
+  max_depth: 6
+  learning_rate: 0.3
+  artifact_dir: null       # null = брать последнюю обученную модель из data.models_dir
 
 data:
   history_start: "2024-01-01"  # начало истории для загрузки/обучения (UTC)
