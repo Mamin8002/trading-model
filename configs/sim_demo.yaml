@@ -1,0 +1,89 @@
+# ДЕМО-конфигурация TEST-симулятора (фаза 4).
+#
+# ВСЕ финансовые значения ниже — ЯВНЫЕ ДЕМОНСТРАЦИОННЫЕ ДОПУЩЕНИЯ,
+# а не реальные тарифы/параметры инструмента. Замените их своими данными:
+# - price_step и lot_size_units — из подтверждённого источника (Finam GetAsset/
+#   GetAssetParams: min_step/decimals/lot_size/trade_lot_size — docs/research.md S3d,
+#   либо спецификация биржи). Выдумывать параметры инструмента запрещено;
+# - комиссии/слиппедж — ваши оценочные допущения (реальные тарифы уточняйте у брокера);
+# - лимиты риска — ваши правила. Без них симулятор БЕЗОПАСНО ОТКАЗЫВАЕТСЯ стартовать.
+#
+# Данные: синтетический демо-файл data/demo/DEMO_M1.csv (НЕ рыночные данные).
+
+run:
+  mode: TEST
+  experiment_id: sim-demo
+  model_dir: models
+  report_dir: reports
+
+data:
+  csv_dir: data/demo
+  symbols:
+    - ticker: DEMO
+      mic: DEMO
+      files:
+        "1m": DEMO_M1.csv   # 5m строится ресэмплингом из 1m (base_timeframe ниже)
+  timestamp_semantics: bar_open
+  source_timezone: Europe/Moscow
+  volume_units: pieces
+
+timeframes:
+  "5m":
+    enabled: true
+    base_timeframe: "1m"
+    lookback_bars: 240
+    horizon_bars: 6
+    label: { kind: fwd_return_class, neutral_band_bps: 5.0 }
+
+# ---------------------------------------------------------------------------
+# Риск-контроль (все значения — ДЕМО-допущения, задаются явно)
+risk:
+  initial_capital_quote: 100000.0   # ДЕМО-капитал в валюте котировки
+  position_units: null              # фиксированный режим отключён
+  risk_per_trade_quote: 500.0       # ДЕМО: макс. убыток на сделку (требует стоп в сигнале)
+  max_position_units: 100           # ДЕМО-лимит позиции, шт
+  max_orders_per_day: 10            # ДЕМО-лимит числа входов в день
+  daily_loss_limit_quote: 1500.0    # ДЕМО-лимит убытка за локальный день
+  max_drawdown_pct: 5.0             # ДЕМО-предел просадки от пика капитала, %
+  max_data_age_seconds: 3600        # ДЕМО-порог свежести данных (в TEST-replay возраст = 0)
+  allow_short: false                # long-only (шорты в фазе 4 не реализованы)
+  halt_on_limit_breach: true        # нарушение дневного лимита/просадки -> остановка входов
+
+# Параметры инструмента — ДЕМО-значения (для реального инструмента брать из
+# подтверждённого источника; null = параметр не подтверждён -> зависимые
+# проверки безопасно откладываются и это фиксируется в журнале)
+instrument:
+  price_step: 0.01        # ДЕМО (у Finam: min_step / 10^decimals)
+  lot_size_units: 1       # ДЕМО (у Finam: trade_lot_size; 0 = недоступно -> стоп-операция)
+  quote_currency: null    # не задана — в отчёте будет «н/д»
+
+# ---------------------------------------------------------------------------
+# TEST-симулятор исполнения
+simulation:
+  commission_bps: 3.0         # ДЕМО-допущение комиссии (не фактический тариф)
+  commission_min_quote: 1.0   # ДЕМО-минимум на сделку
+  slippage_bps: 2.0           # ДЕМО-допущение проскальзывания (невыгодной стороной)
+  conflict_policy: stop_first # консервативное правило «стоп и цель в одном баре»
+                              # (альтернатива require_intrabar_data — остановка с
+                              #  требованием внутрибарных данных; docs/simulation.md §4)
+  journal_path: null          # null -> reports/journal_<experiment>_<tf>.jsonl
+  signal:
+    entry_threshold: 0.55     # вход при proba >= порога
+    exit_threshold: 0.45      # выход при proba <= порога (null = только стоп/цель)
+    stop_bps: 100.0           # ДЕМО-стоп: 1% от цены ФИЛЛА (округляется консервативно до шага)
+    target_bps: 200.0         # ДЕМО-цель: 2% от цены филла
+
+sessions:
+  timezone: Europe/Moscow
+  days:
+    - days: [3]               # демо-данные: четверг
+      sessions:
+        - { start: "10:00", end: "12:00" }
+
+evaluation:
+  trading_days_per_year: 252
+  bars_per_year: null         # null = вывести из данных (медиана баров/день × 252)
+
+finam:
+  base_url: https://api.finam.ru
+  bar_timestamp_semantics: null
