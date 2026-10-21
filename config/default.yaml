@@ -39,5 +39,14 @@ signals:
                                # новый сигнал не выдаётся, рекомендации по позиции не выдаются
   history_display_bars: 10     # сколько последних свечей показывать в консоли
 
+stream:
+  ping_interval_s: 20          # app-level ping (рекомендация Bybit WS)
+  connect_timeout_s: 10
+  recv_timeout_s: 1
+  reconnect_base_s: 1.0        # backoff переподключения: 1, 2, 4, ... секунд
+  reconnect_max_s: 60.0        # не чаще лимитов Bybit (<=500 соединений/5мин)
+  backfill_on_reconnect: true  # догрузка пропущенных закрытых свечей через публичный REST
+  history_bars: 300            # глубина истории закрытых баров в памяти
+
 journal:
   path: data/journal/journal.json   # история сигналов + ручные позиции (переживает перезапуск)

@@ -54,6 +54,19 @@ def interval_to_ms(interval: str) -> int:
     raise DataSourceAPIError(f"Неподдерживаемый interval: {interval!r}")
 
 
+def step_ms_approx(interval: str) -> int:
+    """Шаг сетки в ms: точный для внутридневных, приблизительный для D/W/M."""
+    if interval in INTERVAL_MS:
+        return INTERVAL_MS[interval]
+    if interval == "D":
+        return 86_400_000
+    if interval == "W":
+        return 7 * 86_400_000
+    if interval == "M":
+        return 30 * 86_400_000
+    raise DataSourceAPIError(f"Неподдерживаемый interval: {interval!r}")
+
+
 def period_end_ms(start_ms: int, interval: str) -> int:
     """Момент закрытия свечи (exclusive) для start_ms и интервала."""
     if interval in INTERVAL_MS:
@@ -238,7 +251,8 @@ class BybitSource(MarketDataSource):
 
         Останов: next_start > end_ms / получили меньше limit свечей / нет прогресса.
         """
-        step_ms = period_end_ms(0, interval) if interval in ("D", "W", "M") else interval_to_ms(interval)
+        # для внутридневных интервалов шаг точный; для D/W/M - через period_end_ms (переменная длина)
+        fixed_step_ms = None if interval in ("D", "W", "M") else interval_to_ms(interval)
         by_start: dict[int, Kline] = {}
         cursor = start_ms
         page_size = min(int(limit), MAX_LIMIT)
@@ -261,7 +275,8 @@ class BybitSource(MarketDataSource):
             last_start = batch[-1].start_ms
             if on_progress:
                 on_progress(pages, len(by_start), last_start)
-            next_cursor = period_end_ms(last_start, interval) if step_ms < 0 else last_start + step_ms
+            next_cursor = (period_end_ms(last_start, interval) if fixed_step_ms is None
+                           else last_start + fixed_step_ms)
             if end_ms is not None and next_cursor > end_ms:
                 break
             if len(batch) < page_size:

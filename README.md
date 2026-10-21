@@ -16,9 +16,9 @@
 |---|---|---|
 | 1 | Изучение репозитория модели + документации Bybit, план | ✅ `docs/stage1_research_and_plan.md` |
 | 2a | Загрузка истории Bybit, очистка, сохранение | ✅ проверен пользователем (PASS 9/9, 2026-10-21) |
-| 2b | Переобучение модели, walk-forward-валидация, отчёт | ✅ готов, ждёт проверки пользователем |
-| 3 | WebSocket-мониторинг, сигналы в реальном времени, консольный UI | ⏳ следующий |
-| 4 | Журнал сигналов, ручные позиции, сопровождение | ⏳ |
+| 2b | Переобучение модели, walk-forward-валидация, отчёт | ✅ проверен пользователем (PASS 6/6, 2026-10-21) |
+| 3 | WebSocket-мониторинг, сигналы в реальном времени, консольный UI | ✅ готов, ждёт проверки пользователем |
+| 4 | Журнал сигналов, ручные позиции, сопровождение | ⏳ следующий |
 
 ## Установка
 
@@ -111,6 +111,59 @@ baseline статистически заметно (~5σ), но мало: ожи
 `python scripts\train_model.py` — артефакт зафиксирует новый горизонт, а predictor
 отклонит несовпадение конфига и модели.
 
+## Этап 3: мониторинг в реальном времени
+
+Режимы запуска:
+
+```powershell
+# TEST: офлайн-реплей последних баров из data\processed\ (без сети) + демо-сценарий STALE
+python scripts\run_bot.py --mode TEST --replay-bars 40 --speed 4
+
+# LIVE: публичный WebSocket Bybit (wss://stream.bybit.com/v5/public/spot), до Ctrl+C
+python scripts\run_bot.py --mode LIVE
+python scripts\run_bot.py --mode LIVE --duration 660   # или выйти через 11 минут
+```
+
+Что показывает консольный дашборд: текущую цену (ticker), последние закрытые свечи и
+формирующуюся свечу, состояние соединения (CONNECTED/RECONNECTING/...), свежесть данных
+(FRESH/STALE), текущий сигнал (действие, уверенность, время выдачи, время бара, цена,
+версия модели, горизонт) и историю сигналов.
+
+Ключевые правила:
+- сигнал формируется **только после закрытия свечи** (`confirm=true` в WS-сообщении);
+- app-level ping каждые 20 с; при обрыве — reconnect с backoff 1→60 с и REST-догрузка
+  пропущенных закрытых баров (публичные эндпоинты, read-only);
+- если данные устарели (нет обновлений дольше `signals.stale_after_intervals` интервалов),
+  история неполна или соединение потеряно — это явно показывается, а новый сигнал
+  помечается **не актуальным** (data_fresh=false с перечислением причин);
+- при уверенности ниже `model.confidence_threshold` выдаётся HOLD (воздержание) с причиной.
+
+Ручная проверка этапа (по умолчанию офлайн — детерминированный реплей с фейковыми часами;
+A10 поднимает локальный fake-WS-сервер на 127.0.0.1 — внешняя сеть не нужна):
+
+```powershell
+python scripts\manual_checks\check_stage3_stream.py
+python scripts\manual_checks\check_stage3_stream.py --live              # + read-only WS Bybit (~45 с)
+python scripts\manual_checks\check_stage3_stream.py --live --wait-confirm  # + ждать закрытия реальной свечи (до ~7 мин)
+```
+
+Ожидаемый вывод: `[PASS] A1…A10`, итог `RESULT: PASS (проверок пройдено: 10)` (с `--live`
+добавляется B1 → 11), код возврата 0. Файлы не создаются. A9 — структурный скан кода на
+отсутствие торговых/приватных эндпоинтов и ключей.
+
+### Известные нюансы (Этап 3)
+
+- **UserWarning от XGBoost при загрузке модели** (pickle/serialize): возникает, если
+  артефакт сохранён другой версией XGBoost (например, взят из готового workspace).
+  Предупреждение безвредно — модель работает; чтобы его убрать, переобучите локально:
+  `python scripts\train_model.py`.
+- **Seed истории при старте LIVE**: бот разово догружает ~300 последних закрытых баров
+  через публичный REST для отображения; **сигналы по ним не выдаются** (сигнал — только
+  по барам, закрывшимся при вас, либо по backfill после реального обрыва).
+- **Windows Terminal**: очистка экрана при перерисовке отправляет старые кадры в
+  scrollback — при копировании текста вы можете увидеть несколько кадров подряд; это
+  не дублирование вывода. При проблемах с ANSI используйте `--no-ansi` (или `NO_ANSI=1`).
+
 ## Тесты
 
 ```powershell
@@ -120,14 +173,22 @@ python -m pytest tests -q
 ## Структура
 
 ```
-btc_bot/                  # пакет: config, data_sources (интерфейс + Bybit), data (store/prep)
-scripts/                  # download_history.py, manual_checks/
+btc_bot/                  # пакет
+  config.py               # конфигурация (dataclasses + YAML)
+  data_sources/           # интерфейс MarketDataSource + реализация Bybit (REST)
+  streaming/              # события потока, StreamProcessor (confirm/gaps/freshness), WS-клиент Bybit
+  data/                   # store (raw CSV + metadata), prep (очистка, датасет)
+  model/                  # features, train (артефакт+card), walk_forward, predictor
+  signals/engine.py       # BUY/SELL/HOLD + уверенность + gating по свежести
+  ui/console.py           # консольный дашборд
+  bot.py                  # оркестратор TEST (реплей) / LIVE (WS)
+scripts/                  # download_history.py, train_model.py, run_bot.py, manual_checks/
 config/default.yaml       # конфигурация
-data/                     # raw/, processed/, models/, journal/ (не коммитится)
-docs/                     # план этапа 1, отчёты валидации
+data/                     # raw/, processed/, models/, journal/, manual_checks/ (не коммитится)
+docs/                     # план этапа 1, отчёт валидации
 reference_model/          # копия ноутбуков исходного репозитория (для сверки подхода)
 tests/                    # офлайн unit-тесты
 ```
 
-Интерфейс `btc_bot/data_sources/base.MarketDataSource` позволяет добавить другую
-биржу без изменения остального кода.
+Интерфейс `btc_bot/data_sources/base.MarketDataSource` (и событийная модель
+`btc_bot/streaming/base`) позволяют добавить другую биржу без изменения остального кода.

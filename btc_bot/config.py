@@ -97,6 +97,17 @@ class SignalsCfg:
 
 
 @dataclass
+class StreamCfg:
+    ping_interval_s: int = 20          # рекомендация Bybit: app-level ping каждые 20 с
+    connect_timeout_s: float = 10.0
+    recv_timeout_s: float = 1.0
+    reconnect_base_s: float = 1.0      # backoff: 1, 2, 4, ... <= max
+    reconnect_max_s: float = 60.0      # <= 500 соединений/5мин - не частим
+    backfill_on_reconnect: bool = True # догрузка пропущенных свечей через публичный REST
+    history_bars: int = 300            # сколько закрытых баров держать в памяти
+
+
+@dataclass
 class JournalCfg:
     path: str = "data/journal/journal.json"
 
@@ -108,6 +119,7 @@ class AppConfig:
     model: ModelCfg = field(default_factory=ModelCfg)
     data: DataCfg = field(default_factory=DataCfg)
     signals: SignalsCfg = field(default_factory=SignalsCfg)
+    stream: StreamCfg = field(default_factory=StreamCfg)
     journal: JournalCfg = field(default_factory=JournalCfg)
     project_root: Path = PROJECT_ROOT
     config_path: Optional[Path] = None
@@ -142,6 +154,8 @@ class AppConfig:
             raise ConfigError("model.n_estimators/max_depth/learning_rate должны быть положительными")
         if self.signals.stale_after_intervals < 1:
             raise ConfigError("signals.stale_after_intervals должен быть >= 1")
+        if self.stream.ping_interval_s < 1 or self.stream.reconnect_base_s <= 0 or self.stream.reconnect_max_s < self.stream.reconnect_base_s:
+            raise ConfigError("stream: некорректные параметры ping/reconnect")
         if self.model.algorithm not in ("xgboost",):
             # на этапе 2 поддерживается только xgboost (выбор исходного репозитория)
             raise ConfigError(f"algorithm {self.model.algorithm!r} пока не поддерживается")
@@ -152,6 +166,7 @@ _SUBCFG = {
     "model": ModelCfg,
     "data": DataCfg,
     "signals": SignalsCfg,
+    "stream": StreamCfg,
     "journal": JournalCfg,
 }
 
