@@ -45,7 +45,7 @@ python -m pip install -r requirements.txt
 Проверка установки (офлайн, ~20 с):
 
 ```powershell
-python -m pytest tests -q        # ожидание: 25 passed
+python -m pytest tests -q        # ожидание: 29 passed
 ```
 
 ### Структура проекта
@@ -216,12 +216,42 @@ majority-baseline по окнам. Если accuracy модели система
 ```powershell
 python scripts\run_bot.py --mode LIVE                  # до Ctrl+C
 python scripts\run_bot.py --mode LIVE --duration 660   # автономно 11 минут и выход
-python scripts\run_bot.py --mode LIVE --line-ui        # построчный вывод вместо перерисовки
+python scripts\run_bot.py --mode LIVE --ui line        # строка на месте + события (см. 7.1.1)
+python scripts\run_bot.py --mode LIVE --ui dash        # полноэкранный дашборд (ANSI/VT)
 ```
 
 Что происходит при старте: подключение к `wss://stream.bybit.com/v5/public/spot` →
 подписка на `kline.5.BTCUSDT` и `tickers.BTCUSDT` → разовая REST-догрузка ~300 последних
 свечей для истории на экране (**сигналы по ним не выдаются**).
+
+#### 7.1.1. Режимы интерфейса (`--ui` или `ui.mode` в конфиге)
+
+| Режим | Поведение |
+|---|---|
+| `auto` (по умолчанию) | `dash` в настоящем терминале с ANSI/VT, иначе `line` |
+| `line` | **одна статусная строка обновляется НА МЕСТЕ** (через `\r`, новые строки не добавляются); значимые события печатаются отдельными строками — новый сигнал (~раз в 5 минут), смена соединения, STALE, рекомендация. Работает везде: PowerShell, PyCharm, cmd |
+| `dash` | полноэкранный дашборд на alternate screen: перерисовка на месте, scrollback не засоряется (Windows Terminal / полноценная консоль) |
+| `block` | полный снимок только при изменениях (для логов и перенаправления в файл) |
+
+Статусная строка режима `line`:
+
+```
+● 19:28:45 UTC | CONNECTED | ✓ 2с | 84,456.7 | свеча 19:25 C 84,456.7 | ▲ BUY 0.582 @19:25:01 UTC | pos-000001 +0.12% | [ДЕРЖАТЬ]
+```
+
+Событийные строки (только при событиях):
+
+```
+[19:25:01 UTC] ▲ СИГНАЛ BUY conf 0.582 | цена 84,456.70 | бар 19:20:00→19:25:00 UTC | горизонт 5 мин | модель xgb-...
+    → Рекомендация [ВХОД_ВОЗДЕРЖАНИЕ]: настройте явные условия выхода ...
+[19:28:15 UTC] ● Соединение: CONNECTED (подписка подтверждена)
+[19:40:00 UTC] ⚠ Данные: STALE (нет обновлений 960 с (порог 900 с))
+```
+
+Обозначения: `●` соединение OK/данные свежие, `◐` деградация (STALE/переподключение),
+`○` нет соединения; `▲` BUY, `▼` SELL, `◆` HOLD; `✓` FRESH, `✗/⚠` STALE.
+Цвет включается автоматически при поддержке терминалом (`ui.colors: off` — выключить);
+в терминалах без UTF-8 символы заменяются ASCII-аналогами.
 
 ### 7.2. Как читать дашборд
 
@@ -359,10 +389,10 @@ event-log журнала (`advice_issued`) с привязкой к сигнал
 |---|---|---|
 | `python scripts\manual_checks\check_stage2_data.py` | сбор/очистка/сохранение данных (частично сеть) | `RESULT: PASS (9)` |
 | `python scripts\manual_checks\check_stage2_model.py` | обучение + walk-forward (офлайн) | `RESULT: PASS (6)` |
-| `python scripts\manual_checks\check_stage3_stream.py` | поток/свечи/обрыв/stale/UI (офлайн) | `RESULT: PASS (10)` |
-| `python scripts\manual_checks\check_stage3_stream.py --live` | + реальный WS Bybit (read-only) | `RESULT: PASS (11)` |
+| `python scripts\manual_checks\check_stage3_stream.py` | поток/свечи/обрыв/stale/UI-режимы (офлайн) | `RESULT: PASS (11)` |
+| `python scripts\manual_checks\check_stage3_stream.py --live` | + реальный WS Bybit (read-only) | `RESULT: PASS (12)` |
 | `python scripts\manual_checks\check_stage4_positions.py` | журнал/позиции/сопровождение (офлайн) | `RESULT: PASS (11)` |
-| `python -m pytest tests -q` | unit-тесты | `25 passed` |
+| `python -m pytest tests -q` | unit-тесты | `29 passed` |
 
 Любой сценарий завершается с ненулевым кодом при FAIL — можно встраивать в CI/планировщик.
 
@@ -421,7 +451,7 @@ event-log журнала (`advice_issued`) с привязкой к сигнал
 | HTTP 403 от Bybit при загрузке | Превышен IP-лимит; подождите ~10 минут, повторите |
 | `RECONNECTING` в дашборде | Обрыв сети/прокси; бот переподключится сам и догрузит пропущенные свечи; сигналы в этот период помечаются неактуальными |
 | `STALE` длительное время | Нет обновлений >15 мин: проверьте сеть/региональную доступность `stream.bybit.com` |
-| Дашборд «множится» в терминале | Копируется scrollback Windows Terminal — на экране одна панель; при проблемах с ANSI используйте `--line-ui` |
+| Дашборд «множится» в терминале | Включите режим строки: `--ui line` (по умолчанию в средах без ANSI `auto` сам выберет `line`); `--ui dash` — только в терминалах с полноценным VT (Windows Terminal) |
 | `Журнал ... повреждён` | Файл журнала не перезаписывается молча; восстановите из копии или переместите повреждённый файл и создайте новый |
 | Время на машине спешит/отстаёт | Бот использует серверное время Bybit для данных; drift до 2 мин ни на что не влияет |
 

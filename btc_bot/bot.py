@@ -37,7 +37,17 @@ from .streaming.base import (
 )
 from .streaming.bybit_ws import BybitWsClient
 from .streaming.processor import StreamProcessor
-from .ui.console import ConsoleUI, format_snapshot_text
+from .ui.console import (
+    ConsoleUI,
+    event_advice_text,
+    event_fresh_text,
+    event_gap_text,
+    event_info,
+    event_signal_text,
+    event_state_text,
+    format_snapshot_text,
+    format_status_line,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +104,7 @@ class MonitorBot:
     # -- event plumbing ----------------------------------------------------
     def dispatch(self, events: list) -> list[Signal]:
         new_signals: list[Signal] = []
+        logged = False
         for ev in events:
             if isinstance(ev, KlineBar) and ev.confirmed:
                 sig = self.engine.on_confirmed_bar(ev)
@@ -101,18 +112,29 @@ class MonitorBot:
                     new_signals.append(sig)
             elif isinstance(ev, StateChange):
                 self.engine.on_conn_state(ev.state)
+                self.ui.log_event(event_state_text(ev))
+                logged = True
                 if ev.state == ConnState.CONNECTED:
                     self._on_connected()
             elif isinstance(ev, FreshnessChange):
                 self.engine.on_freshness(ev)
+                self.ui.log_event(event_fresh_text(ev))
+                logged = True
             elif isinstance(ev, GapDetected):
                 self.engine.on_gap(ev)
+                self.ui.log_event(event_gap_text(ev))
+                logged = True
             elif isinstance(ev, ErrorEvent):
                 logger.warning("Ошибка стрима: %s", ev.detail)
         for sig in new_signals:
+            self.ui.log_event(event_signal_text(sig))
+            logged = True
             self._journal_and_advise(sig)
             if self.on_signal:
                 self.on_signal(sig)
+        if logged and self.ui.mode == "line":
+            # статусная строка под событием должна быть свежей сразу, не ждать refresh_s
+            self.ui.render(self.build_view(), force=True)
         return new_signals
 
     def _journal_and_advise(self, sig: Signal) -> None:
@@ -128,6 +150,7 @@ class MonitorBot:
                              if self.processor.last_price else sig.price_at_signal)
                 advice = self.advisor.evaluate(sig, price_now=price_now)
                 self.last_advice = advice
+                self.ui.log_event(event_advice_text(advice))
                 if self.journal is not None:
                     self.journal.record_advice(advice.to_dict(), signal_id=sig.signal_id)
             except Exception as e:  # noqa: BLE001
@@ -156,6 +179,7 @@ class MonitorBot:
                     self.processor.ingest_backfilled(klines)  # без dispatch: история для UI
                 logger.info("Seed истории через REST: %d баров (сигналы по ним не выдаются)",
                             len(klines))
+                self.ui.log_event(event_info(f"Seed истории: {len(klines)} баров (сигналы по ним не выдаются)"))
             else:
                 last = self.processor.confirmed[-1] if self.processor.confirmed else None
                 if last is not None:
@@ -166,6 +190,7 @@ class MonitorBot:
                             self.cfg.exchange.interval, start_ms=expected_next, end_ms=now_ms)
                         logger.info("Backfill после reconnect: %d баров", len(klines))
                         if klines:
+                            self.ui.log_event(event_info(f"REST-догрузка после reconnect: {len(klines)} баров"))
                             self.dispatch(self.processor.ingest_backfilled(klines))
         except DataSourceError as e:
             logger.warning("REST-догрузка не удалась (продолжаем на WS): %s", e)
@@ -266,6 +291,7 @@ class MonitorBot:
             reconnect_max_s=self.cfg.stream.reconnect_max_s,
         )
         client.start()
+        self.ui.begin()
         t_start = time.monotonic()
         try:
             while True:
@@ -284,15 +310,21 @@ class MonitorBot:
                     elif kind == "error":
                         logger.warning("WS: %s", item[1])
                 self.dispatch(self.processor.tick())
-                self.ui.render(self.build_view())
+                if self.ui.should_render():
+                    self.ui.render(self.build_view())
                 if duration_s and (time.monotonic() - t_start) >= duration_s:
                     break
                 time.sleep(0.05)
         except KeyboardInterrupt:
-            print("\nОстановка по Ctrl+C...")
+            self.ui.print_event("Остановка по Ctrl+C...")
         finally:
             client.stop()
-            self.ui.render(self.build_view(extra_warnings=["остановлено"]), force=True)
+            final_view = self.build_view(extra_warnings=["остановлено"])
+            self.ui.render(final_view, force=True)
+            was_dash = self.ui.mode == "dash"
+            self.ui.end()
+            if was_dash:
+                self.ui.print_event(format_status_line(final_view, self.ui.glyphs) + "   [остановлено]")
         return 0
 
     # -- TEST (реплей) ------------------------------------------------------------
@@ -354,8 +386,12 @@ class MonitorBot:
             fake_now["ms"] += self.processor.stale_after_ms + 60_000
             self.dispatch(self.processor.tick(now_ms=fake_now["ms"]))
             view = self.build_view(extra_warnings=["ДЕМО: данные устарели (STALE) - новые сигналы не выдаются как актуальные"])
-            self.ui.render(view, force=True)
-            if not self.ui.ansi:
+            if self.ui.mode == "line":
+                self.ui.log_event(event_info("ДЕМО: данные устарели (STALE) - новые сигналы не выдаются как актуальные"))
+                self.ui.render(view, force=True)
+            elif self.ui.mode == "dash":
+                self.ui.render(view, force=True)
+            else:
                 self.ui.render_full_once(view)
 
         n_fresh = sum(1 for s in all_signals if s.data_fresh)

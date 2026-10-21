@@ -46,7 +46,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no-demo-stale", action="store_true", help="TEST: без демо-сценария STALE")
     p.add_argument("--duration", type=float, default=0.0, help="LIVE: секунды (0 - до Ctrl+C)")
     p.add_argument("--line-ui", "--no-ansi", dest="line_ui", action="store_true",
-                   help="принудительно построчный вывод (без ANSI-перерисовки)")
+                   help="то же, что --ui line (одна обновляемая строка + события)")
+    p.add_argument("--ui", choices=["auto", "dash", "line", "block"], default=None,
+                   help="режим интерфейса (по умолчанию ui.mode из конфига = auto)")
     p.add_argument("--model-dir", default=None, help="переопределить каталог артефакта модели")
     p.add_argument("--journal", default=None,
                    help="путь журнала сигналов/позиций (по умолчанию: LIVE - journal.path из конфига, "
@@ -79,7 +81,10 @@ def main() -> int:
              cfg.exchange.category, cfg.exchange.symbol, cfg.exchange.interval,
              cfg.model.horizon_bars, cfg.horizon_minutes, cfg.model.confidence_threshold)
 
-    ui = ConsoleUI(force_line_mode=args.line_ui)
+    ui_mode = "line" if args.line_ui else (args.ui or cfg.ui.mode)
+    ui = ConsoleUI(mode=ui_mode, refresh_s=cfg.ui.refresh_s,
+                   log_events=cfg.ui.log_events, colors=cfg.ui.colors)
+    log.info("Интерфейс: режим %s (цвета: %s)", ui.mode, "вкл" if ui.colors else "выкл")
     rest_source = None
     if cfg.mode == "LIVE":
         rest_source = BybitSource(

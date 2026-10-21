@@ -215,7 +215,8 @@ class StreamProcessor:
             self._fresh_emitted = fresh
             events.append(FreshnessChange(
                 fresh, age if age is not None else -1,
-                "данные свежие" if fresh else f"нет обновлений {age} мс (порог {self.stale_after_ms} мс)",
+                "данные свежие" if fresh else
+                f"нет обновлений {(age or 0) / 1000:.0f} с (порог {self.stale_after_ms / 1000:.0f} с)",
                 now,
             ))
         else:

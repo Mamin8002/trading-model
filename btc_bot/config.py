@@ -122,6 +122,14 @@ class PositionsCfg:
 
 
 @dataclass
+class UiCfg:
+    mode: str = "auto"       # auto | dash | line | block
+    log_events: bool = True  # line/block: печатать значимые события отдельными строками
+    refresh_s: float = 1.0   # частота обновления статусной строки/дашборда
+    colors: str = "auto"     # auto | on | off
+
+
+@dataclass
 class JournalCfg:
     path: str = "data/journal/journal.json"
 
@@ -135,6 +143,7 @@ class AppConfig:
     signals: SignalsCfg = field(default_factory=SignalsCfg)
     stream: StreamCfg = field(default_factory=StreamCfg)
     positions: PositionsCfg = field(default_factory=PositionsCfg)
+    ui: UiCfg = field(default_factory=UiCfg)
     journal: JournalCfg = field(default_factory=JournalCfg)
     project_root: Path = PROJECT_ROOT
     config_path: Optional[Path] = None
@@ -171,6 +180,12 @@ class AppConfig:
             raise ConfigError("signals.stale_after_intervals должен быть >= 1")
         if self.stream.ping_interval_s < 1 or self.stream.reconnect_base_s <= 0 or self.stream.reconnect_max_s < self.stream.reconnect_base_s:
             raise ConfigError("stream: некорректные параметры ping/reconnect")
+        if self.ui.mode not in ("auto", "dash", "line", "block"):
+            raise ConfigError("ui.mode должен быть auto|dash|line|block")
+        if self.ui.colors not in ("auto", "on", "off"):
+            raise ConfigError("ui.colors должен быть auto|on|off")
+        if self.ui.refresh_s <= 0:
+            raise ConfigError("ui.refresh_s должен быть > 0")
         er = self.positions.exit_rules
         for name, val in (("take_profit_pct", er.take_profit_pct), ("stop_loss_pct", er.stop_loss_pct)):
             if val is not None and (not isinstance(val, (int, float)) or val <= 0):
@@ -194,6 +209,7 @@ _SUBCFG = {
     "signals": SignalsCfg,
     "stream": StreamCfg,
     "positions": PositionsCfg,
+    "ui": UiCfg,
     "journal": JournalCfg,
 }
 

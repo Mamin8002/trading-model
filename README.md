@@ -123,14 +123,43 @@ python scripts\manual_checks\check_stage2_model.py   # ожидание: RESULT:
 ```powershell
 python scripts\run_bot.py --mode LIVE                 # до Ctrl+C
 python scripts\run_bot.py --mode LIVE --duration 660  # или фиксированная длительность
+python scripts\run_bot.py --mode LIVE --ui line       # одна строка на месте + события
+python scripts\run_bot.py --mode LIVE --ui dash       # полноэкранный дашборд (ANSI)
 python scripts\run_bot.py --mode TEST --replay-bars 40 --speed 4   # офлайн-демо
-python scripts\manual_checks\check_stage3_stream.py                # ожидание: RESULT: PASS (10)
-python scripts\manual_checks\check_stage3_stream.py --live         # + read-only WS Bybit: PASS (11)
+python scripts\manual_checks\check_stage3_stream.py                # ожидание: RESULT: PASS (11)
+python scripts\manual_checks\check_stage3_stream.py --live         # + read-only WS Bybit: PASS (12)
 ```
 
-Дашборд показывает: цену (ticker), последние закрытые свечи и формирующуюся свечу,
-состояние соединения, свежесть данных (FRESH/STALE), текущий сигнал (действие,
-уверенность, время выдачи, время бара, цена, версия модели, горизонт), историю
+### Режимы интерфейса (`--ui` или `ui.mode` в конфиге)
+
+| Режим | Поведение |
+|---|---|
+| `auto` (по умолчанию) | `dash` в настоящем терминале с ANSI/VT; иначе `line` |
+| `line` | **одна статусная строка обновляется НА МЕСТЕ** (`\r`, новые строки не добавляются); значимые события (новый сигнал раз в ~5 мин, смена соединения, STALE, рекомендация) печатаются отдельными строками. Работает везде: PowerShell, PyCharm, cmd |
+| `dash` | полноэкранный дашборд на alternate screen: перерисовка на месте, scrollback не засоряется (Windows Terminal / полноценная консоль) |
+| `block` | полный снимок печатается только при изменениях (для логов/перенаправления) |
+
+Пример статусной строки (`line`):
+
+```
+● 19:28:45 UTC | CONNECTED | ✓ 2с | 84,456.7 | свеча 19:25 C 84,456.7 | ▲ BUY 0.582 @19:25:01 UTC | pos-000001 +0.12% | [ДЕРЖАТЬ]
+```
+
+Пример событийных строк (печатаются только при событиях, не каждую секунду):
+
+```
+[19:25:01 UTC] ▲ СИГНАЛ BUY conf 0.582 | цена 84,456.70 | бар 19:20:00 UTC→19:25:00 UTC | горизонт 5 мин | модель xgb-...
+    → Рекомендация [ВХОД_ВОЗДЕРЖАНИЕ]: настройте явные условия выхода ...
+[19:28:15 UTC] ● Соединение: CONNECTED (подписка подтверждена)
+[19:40:00 UTC] ⚠ Данные: STALE (нет обновлений 960 с (порог 900 с))
+```
+
+Цвет и Unicode-символы (●▲▼◆✓⚠) включаются автоматически при поддержке терминалом;
+`ui.colors: off` в конфиге отключает цвет, в терминалах без UTF-8 используются ASCII-символы.
+
+Полный дашборд (`dash`/`block`) показывает: цену (ticker), последние закрытые свечи и
+формирующуюся свечу, состояние соединения, свежесть данных (FRESH/STALE), текущий сигнал
+(действие, уверенность, время выдачи, время бара, цена, версия модели, горизонт), историю
 сигналов, открытые позиции и рекомендацию советника.
 
 Правила: сигнал — только после закрытия свечи (`confirm=true`); ping каждые 20 с;
@@ -201,9 +230,9 @@ python scripts\manual_checks\check_stage4_positions.py   # ожидание: RES
 |---|---|---|
 | `python scripts\manual_checks\check_stage2_data.py` | сбор/очистка/сохранение данных | `RESULT: PASS (9)` |
 | `python scripts\manual_checks\check_stage2_model.py` | обучение + walk-forward на воспроизводимом наборе | `RESULT: PASS (6)` |
-| `python scripts\manual_checks\check_stage3_stream.py [--live]` | поток, закрытие свечи, обрыв, stale, сигналы, UI | `RESULT: PASS (10/11)` |
+| `python scripts\manual_checks\check_stage3_stream.py [--live]` | поток, закрытие свечи, обрыв, stale, сигналы, UI-режимы | `RESULT: PASS (11/12)` |
 | `python scripts\manual_checks\check_stage4_positions.py` | журнал, позиции, сопровождение | `RESULT: PASS (11)` |
-| `python -m pytest tests -q` | unit-тесты (офлайн) | `25 passed` |
+| `python -m pytest tests -q` | unit-тесты (офлайн) | `29 passed` |
 
 Все сценарии работают без секретов и без торговых операций, печатают PASS/FAIL и
 завершаются с ненулевым кодом при ошибке.
@@ -236,9 +265,11 @@ tests/                    # офлайн unit-тесты (25)
 
 - **UserWarning XGBoost о pickle при загрузке модели**: артефакт сохранён другой версией
   XGBoost. Безвредно; устраняется локальным переобучением `python scripts\train_model.py`.
-- **Кадры дашборда при копировании из терминала**: в Windows Terminal очистка экрана
-  сдвигает старые кадры в scrollback — на экране это одна панель. При проблемах с ANSI:
-  `--line-ui` (или `NO_ANSI=1`).
+- **Вывод «множится» / старые кадры дашборда**: с версии UI-2 по умолчанию в терминалах
+  без полноценного ANSI используется режим `line` — одна строка обновляется на месте,
+  события печатаются редко. Принудительно: `--ui line` (строка на месте), `--ui dash`
+  (полный экран на alternate screen, только терминалы с VT), `--ui block` (снимки по
+  изменению, для логов). `NO_ANSI=1` отключает ANSI целиком.
 - **403 от Bybit**: превышен IP-лимит (600 запросов/5 с) — подождите ~10 минут;
   загрузчик истории троттлит запросы автоматически.
 - **Журнал повреждён**: бот не перезаписывает его молча — восстановите файл вручную

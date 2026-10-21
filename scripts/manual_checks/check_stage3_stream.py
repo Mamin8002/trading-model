@@ -9,11 +9,12 @@ r"""Ручная проверка Этапа 3: поток данных, зак�
 
 По умолчанию работает БЕЗ внешней сети и без секретов: сценарии A1-A8 - детерминированный
 реплей сообщений с фейковыми часами; A9 - структурный скан кода на отсутствие торговых
-вызовов; A10 - полный LIVE-тракт на ЛОКАЛЬНОМ fake-WS-сервере (127.0.0.1, эфемерный порт).
-Файлы не создаются (тестовые модели - во временных каталогах).
+вызовов; A10 - полный LIVE-тракт на ЛОКАЛЬНОМ fake-WS-сервере (127.0.0.1, эфемерный порт);
+A11 - режимы консоли (line: одна строка обновляется на месте; dash: alternate screen;
+block: снимок по изменению). Файлы не создаются (тестовые модели - во временных каталогах).
 
-Ожидаемый вывод: строки [PASS]/[FAIL], итог "RESULT: PASS (проверок пройдено: 10)",
-код возврата 0. Время выполнения: ~15-25 с.
+Ожидаемый вывод: строки [PASS]/[FAIL], итог "RESULT: PASS (проверок пройдено: 11)"
+(с --live: 12), код возврата 0. Время выполнения: ~15-25 с.
 """
 
 from __future__ import annotations
@@ -426,6 +427,74 @@ def check_a10_live_pipeline_local(tmp: Path) -> None:
            ok, detail)
 
 
+def check_a11_ui_modes() -> None:
+    """Режимы UI: line (строка на месте), dash (alternate screen), block (по изменению)."""
+    from btc_bot.signals.engine import Signal
+    from btc_bot.ui.console import ConsoleUI as UI, format_status_line
+
+    sig = Signal(signal_id="sig-ui", created_at_ms=BASE + STEP, bar_start_ms=BASE,
+                 bar_end_ms=BASE + STEP, symbol="BTCUSDT", category="spot", interval=INTERVAL,
+                 action="BUY", confidence=0.582, prob_up=0.582, raw_direction=1,
+                 price_at_signal=84_500.0, price_source="ticker", model_version="xgb-ui-test",
+                 horizon_bars=1, horizon_minutes=5, feature_set="ratio", data_fresh=True,
+                 reasons=(), origin="ws", features={})
+
+    def make_view(price: float) -> dict:
+        return {
+            "mode": "LIVE", "exchange": {"category": "spot", "symbol": "BTCUSDT", "interval": "5"},
+            "model": {"version": "xgb-ui-test", "horizon_minutes": 5, "threshold": 0.55, "feature_set": "ratio"},
+            "conn_state": "CONNECTED", "conn_detail": "ok", "reconnect_count": 0,
+            "fresh": True, "age_s": 2.0, "stale_threshold_s": 900.0, "server_ts_ms": BASE,
+            "price": price, "price_age_s": 0.5, "live_candle": None, "bars": [],
+            "display_bars": 5, "last_signal": sig, "signal_history": [sig],
+            "positions": [], "portfolio_stats": None, "journal_path": None,
+            "last_advice": None, "warnings": [], "rendered_at_ms": BASE + STEP,
+        }
+
+    v1, v2 = make_view(84_500.0), make_view(84_600.0)
+
+    # line: две перерисовки -> НИ ОДНОГО перевода строки (обновление на месте через \r)
+    s1 = io.StringIO()
+    ui1 = UI(stream=s1, mode="line", refresh_s=0.0)
+    ui1.render(v1, force=True)
+    ui1.render(v2, force=True)
+    out = s1.getvalue()
+    ok_line = ("\n" not in out) and out.count("\r") >= 2 and "84,600" in out
+    # событие -> ровно одна новая строка, статусная строка восстановлена
+    ui1.log_event("[тест] событие")
+    out2 = s1.getvalue()
+    ok_event = out2.count("\n") == 1
+
+    # dash: alternate screen + перерисовка без накопления
+    s2 = io.StringIO()
+    ui2 = UI(stream=s2, mode="dash", refresh_s=0.0)
+    ui2.begin()
+    ui2.render(v1, force=True)
+    ui2.render(v2, force=True)
+    ui2.end()
+    outd = s2.getvalue()
+    ok_dash = (outd.startswith("\x1b[?1049h") and outd.count("BTC MONITOR") == 2
+               and outd.endswith("\x1b[?25h\x1b[?1049l"))
+
+    # block: идентичный снимок печатается один раз, изменившийся - ещё раз
+    s3 = io.StringIO()
+    ui3 = UI(stream=s3, mode="block", refresh_s=0.0)
+    ui3.render(v1)
+    ui3.render(v1)
+    once = s3.getvalue().count("BTC MONITOR") == 1
+    ui3.render(v2)
+    ok_block = once and s3.getvalue().count("BTC MONITOR") == 2
+
+    # содержимое статусной строки
+    line_txt = format_status_line(v2)
+    ok_content = all(x in line_txt for x in ("CONNECTED", "84,600", "BUY", "0.582"))
+
+    record("A11 UI-режимы: line обновляет ОДНУ строку на месте (события - отдельными), dash - alternate screen, block - по изменению",
+           ok_line and ok_event and ok_dash and ok_block and ok_content,
+           f"line_inplace={ok_line}, event_newline={ok_event}, dash_alt={ok_dash}, "
+           f"block_dedup={ok_block}, status_content={ok_content}")
+
+
 def check_a9_no_trading_calls() -> None:
     # структурный скан: никаких торговых/приватных эндпоинтов и ключей в коде бота
     p1, p2, p3 = "/v5/" + "order", "/v5/" + "position", "/v5/" + "account"
@@ -518,6 +587,7 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as td_str:
         tmp = Path(td_str)
         check_a10_live_pipeline_local(tmp)
+    check_a11_ui_modes()
 
     if args.live:
         print("-- Часть B: LIVE read-only проверка публичного WS Bybit --")
