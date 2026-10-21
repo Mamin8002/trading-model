@@ -59,14 +59,18 @@ def load_predictor(cfg: AppConfig) -> tuple[Predictor, Path]:
 
 
 class MonitorBot:
-    """Общая логика LIVE/TEST: события -> процессор -> движок -> UI."""
+    """Общая логика LIVE/TEST: события -> процессор -> движок -> журнал/советник -> UI."""
 
     def __init__(self, cfg: AppConfig, predictor: Predictor, ui: ConsoleUI,
                  clock_ms: Optional[Callable[[], int]] = None,
-                 rest_source: Optional[BybitSource] = None):
+                 rest_source: Optional[BybitSource] = None,
+                 journal=None, advisor=None):
         self.cfg = cfg
         self.predictor = predictor
         self.ui = ui
+        self.journal = journal          # portfolio.journal.Journal | None
+        self.advisor = advisor          # portfolio.advisor.PositionAdvisor | None
+        self.last_advice = None
         self.processor = StreamProcessor(
             cfg.exchange.symbol, cfg.exchange.interval,
             stale_after_intervals=cfg.signals.stale_after_intervals,
@@ -106,9 +110,28 @@ class MonitorBot:
             elif isinstance(ev, ErrorEvent):
                 logger.warning("Ошибка стрима: %s", ev.detail)
         for sig in new_signals:
+            self._journal_and_advise(sig)
             if self.on_signal:
                 self.on_signal(sig)
         return new_signals
+
+    def _journal_and_advise(self, sig: Signal) -> None:
+        """Журналирование сигнала + оценка советником (Этап 4)."""
+        if self.journal is not None:
+            try:
+                self.journal.record_signal(sig)
+            except Exception as e:  # noqa: BLE001 - журнал не должен ронять мониторинг
+                logger.error("Не удалось записать сигнал в журнал: %s", e)
+        if self.advisor is not None:
+            try:
+                price_now = (self.processor.last_price.price
+                             if self.processor.last_price else sig.price_at_signal)
+                advice = self.advisor.evaluate(sig, price_now=price_now)
+                self.last_advice = advice
+                if self.journal is not None:
+                    self.journal.record_advice(advice.to_dict(), signal_id=sig.signal_id)
+            except Exception as e:  # noqa: BLE001
+                logger.error("Ошибка советника: %s", e)
 
     def _on_connected(self) -> None:
         """После (пере)подключения: seed/backfill истории через публичный REST.
@@ -160,6 +183,45 @@ class MonitorBot:
             warnings.append(f"разрыв истории баров: ожидался бар {g.expected_start_ms}, "
                             f"получен {g.got_start_ms} (ms)")
         card = self.predictor.card
+        price_now = snap.last_price.price if snap.last_price else (
+            snap.confirmed_bars[-1].close if snap.confirmed_bars else None)
+
+        # -- Этап 4: позиции из журнала + последняя рекомендация советника --
+        positions_view: list[dict] = []
+        stats = None
+        journal_path = None
+        if self.journal is not None:
+            try:
+                journal_path = str(self.journal.path)
+                stats = self.journal.stats()
+                for p in self.journal.open_positions(self.cfg.exchange.symbol):
+                    rules = p.exit_rules
+                    if not rules and self.advisor is not None:
+                        rules = self.advisor.default_exit_rules
+                    bar_end = snap.confirmed_bars[-1].end_ms if snap.confirmed_bars else None
+                    rules_txt = (self.advisor.rules_text(rules or {}, p, price_now, bar_end)
+                                 if self.advisor is not None else str(rules))
+                    src = p.data.get("source_signal") or {}
+                    positions_view.append({
+                        "position_id": p.position_id,
+                        "direction": p.data["direction"],
+                        "symbol": p.data["symbol"],
+                        "entry_price": p.entry_price,
+                        "opened_at_utc": p.data.get("opened_at_utc"),
+                        "quantity_open": p.quantity_open,
+                        "quantity_initial": float(p.data["quantity_initial"]),
+                        "price_now": price_now,
+                        "unrealized_pct": (p.unrealized_pct(price_now) if price_now else None),
+                        "rules_text": rules_txt,
+                        "source_signal_id": src.get("signal_id"),
+                        "source_signal_action": src.get("action"),
+                        "source_signal_conf": src.get("confidence"),
+                        "horizon_minutes": src.get("horizon_minutes"),
+                        "model_version": src.get("model_version"),
+                    })
+            except Exception as e:  # noqa: BLE001 - проблемы журнала не роняют мониторинг
+                warnings.append(f"журнал недоступен: {e}")
+
         return {
             "mode": self.mode,
             "exchange": {"category": self.cfg.exchange.category,
@@ -183,7 +245,10 @@ class MonitorBot:
             "display_bars": self.cfg.signals.history_display_bars,
             "last_signal": self.engine.last_signal,
             "signal_history": self.engine.recent_signals(5),
-            "positions_text": None,  # Этап 4
+            "positions": positions_view,
+            "portfolio_stats": stats,
+            "journal_path": journal_path,
+            "last_advice": (self.last_advice.to_dict() if self.last_advice else None),
             "warnings": warnings,
             "rendered_at_ms": now_ms,
         }

@@ -112,9 +112,41 @@ def format_snapshot_text(view: dict) -> str:
     else:
         lines.append(" История сигналов: пуста")
 
-    pos_txt = view.get("positions_text")
     lines.append(THIN)
-    lines.append(f" Позиции: {pos_txt if pos_txt else '(учёт позиций - Этап 4; фактическое состояние портфеля неизвестно)'}")
+    journal_path = view.get("journal_path")
+    stats = view.get("portfolio_stats")
+    if journal_path:
+        stats_txt = (f" | сигналов: {stats['n_signals']}, позиций: {stats['n_positions']} "
+                     f"(открыто {stats['n_open']}, закрыто {stats['n_closed']},"
+                     f" PnL {stats['total_realized_pnl_quote']:+.2f} USDT)" if stats else "")
+        lines.append(f" Журнал: {journal_path}{stats_txt}")
+    positions = view.get("positions") or []
+    if positions:
+        lines.append(" Открытые позиции (зарегистрированы вручную):")
+        for p in positions:
+            unreal = (f"{p['unrealized_pct']:+.3f}%"
+                      if p.get("unrealized_pct") is not None and p.get("price_now") else "н/д")
+            price_now_txt = f"{p['price_now']:,.2f}" if p.get("price_now") else "н/д"
+            lines.append(f"   {p['position_id']} {p['direction']} {p['symbol']}: вход {p['entry_price']:,.2f} "
+                         f"({p.get('opened_at_utc', '?')}), объём {p['quantity_open']:g} из "
+                         f"{p['quantity_initial']:g}, текущая {price_now_txt} ({unreal})")
+            if p.get("source_signal_id"):
+                lines.append(f"     исходный сигнал: {p['source_signal_id']} "
+                             f"({p.get('source_signal_action')} conf {p.get('source_signal_conf'):.3f}, "
+                             f"горизонт {p.get('horizon_minutes')} мин, модель {p.get('model_version')})")
+            else:
+                lines.append("     исходный сигнал: не привязана (ручная регистрация)")
+            lines.append(f"     условия выхода: {p.get('rules_text') or 'не заданы'}")
+    else:
+        lines.append(" Позиции: зарегистрированных открытых позиций нет - фактическое состояние "
+                     "портфеля неизвестно (бот не может знать его без ручной регистрации)")
+
+    advice = view.get("last_advice")
+    if advice:
+        lines.append(f" Рекомендация [{advice['action']}] (по сигналу {advice.get('signal_id')}):")
+        lines.append(f"   {advice['text']}")
+        for r in (advice.get("reasons") or [])[:4]:
+            lines.append(f"   - {r}")
 
     warnings = view.get("warnings") or []
     lines.append(f" Предупреждения: {'; '.join(warnings) if warnings else 'нет'}")

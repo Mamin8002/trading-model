@@ -108,6 +108,20 @@ class StreamCfg:
 
 
 @dataclass
+class ExitRulesCfg:
+    """Явно задаваемые условия выхода. None = правило НЕ задано (бот его не изобретает)."""
+    take_profit_pct: Optional[float] = None   # % роста от цены входа -> рекомендация закрыть
+    stop_loss_pct: Optional[float] = None     # % снижения от цены входа -> рекомендация закрыть
+    max_hold_bars: Optional[int] = None       # макс. число баров удержания -> рекомендация закрыть
+
+
+@dataclass
+class PositionsCfg:
+    exit_rules: ExitRulesCfg = field(default_factory=ExitRulesCfg)
+    allow_short: bool = False   # spot: SELL НЕ открывает шорт; регистрация SHORT запрещена
+
+
+@dataclass
 class JournalCfg:
     path: str = "data/journal/journal.json"
 
@@ -120,6 +134,7 @@ class AppConfig:
     data: DataCfg = field(default_factory=DataCfg)
     signals: SignalsCfg = field(default_factory=SignalsCfg)
     stream: StreamCfg = field(default_factory=StreamCfg)
+    positions: PositionsCfg = field(default_factory=PositionsCfg)
     journal: JournalCfg = field(default_factory=JournalCfg)
     project_root: Path = PROJECT_ROOT
     config_path: Optional[Path] = None
@@ -156,6 +171,17 @@ class AppConfig:
             raise ConfigError("signals.stale_after_intervals должен быть >= 1")
         if self.stream.ping_interval_s < 1 or self.stream.reconnect_base_s <= 0 or self.stream.reconnect_max_s < self.stream.reconnect_base_s:
             raise ConfigError("stream: некорректные параметры ping/reconnect")
+        er = self.positions.exit_rules
+        for name, val in (("take_profit_pct", er.take_profit_pct), ("stop_loss_pct", er.stop_loss_pct)):
+            if val is not None and (not isinstance(val, (int, float)) or val <= 0):
+                raise ConfigError(f"positions.exit_rules.{name} должен быть null или > 0")
+        if er.max_hold_bars is not None and (not isinstance(er.max_hold_bars, int) or er.max_hold_bars < 1):
+            raise ConfigError("positions.exit_rules.max_hold_bars должен быть null или целым >= 1")
+        if self.positions.allow_short:
+            raise ConfigError(
+                "positions.allow_short=true не поддерживается: бот работает со spot без shorts "
+                "(SELL = закрыть/уменьшить длинную позицию)"
+            )
         if self.model.algorithm not in ("xgboost",):
             # на этапе 2 поддерживается только xgboost (выбор исходного репозитория)
             raise ConfigError(f"algorithm {self.model.algorithm!r} пока не поддерживается")
@@ -167,16 +193,27 @@ _SUBCFG = {
     "data": DataCfg,
     "signals": SignalsCfg,
     "stream": StreamCfg,
+    "positions": PositionsCfg,
     "journal": JournalCfg,
 }
 
+_NESTED_CFG = {
+    "positions": {"exit_rules": ExitRulesCfg},
+}
 
-def _cfg_from_dict(cls, d: dict[str, Any]):
+
+def _cfg_from_dict(cls, d: dict[str, Any], nested: Optional[dict] = None):
     known = {f.name for f in fields(cls)}
     unknown = set(d) - known
     if unknown:
         raise ConfigError(f"Неизвестные ключи в секции {cls.__name__}: {sorted(unknown)}")
-    return cls(**d)
+    kwargs = dict(d)
+    for key, subcls in (nested or {}).items():
+        if key in kwargs:
+            if not isinstance(kwargs[key], dict):
+                raise ConfigError(f"{cls.__name__}.{key} должен быть словарём")
+            kwargs[key] = _cfg_from_dict(subcls, kwargs[key])
+    return cls(**kwargs)
 
 
 def _deep_merge(base: dict, override: dict) -> dict:
@@ -220,7 +257,7 @@ def load_config(path: str | Path | None = None, overrides: Optional[dict] = None
         section = raw.get(key, {}) or {}
         if not isinstance(section, dict):
             raise ConfigError(f"Секция {key} должна быть словарём")
-        kwargs[key] = _cfg_from_dict(cls, section)
+        kwargs[key] = _cfg_from_dict(cls, section, nested=_NESTED_CFG.get(key))
     if "mode" in raw:
         kwargs["mode"] = str(raw["mode"]).upper()
 

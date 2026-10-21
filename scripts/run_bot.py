@@ -25,7 +25,9 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from btc_bot.bot import MonitorBot, load_predictor  # noqa: E402
 from btc_bot.config import load_config  # noqa: E402
-from btc_bot.data_sources.bybit import BybitSource  # noqa: E402
+from btc_bot.data_sources.bybit import BybitSource, step_ms_approx  # noqa: E402
+from btc_bot.portfolio.advisor import PositionAdvisor  # noqa: E402
+from btc_bot.portfolio.journal import Journal, JournalError  # noqa: E402
 from btc_bot.ui.console import ConsoleUI  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -46,6 +48,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--line-ui", "--no-ansi", dest="line_ui", action="store_true",
                    help="принудительно построчный вывод (без ANSI-перерисовки)")
     p.add_argument("--model-dir", default=None, help="переопределить каталог артефакта модели")
+    p.add_argument("--journal", default=None,
+                   help="путь журнала сигналов/позиций (по умолчанию: LIVE - journal.path из конфига, "
+                        "TEST - data/journal/journal_test.json, чтобы демо-сигналы не смешивались "
+                        "с боевой историей)")
     return p.parse_args()
 
 
@@ -83,7 +89,32 @@ def main() -> int:
             max_retries=cfg.exchange.max_retries,
         )
 
-    bot = MonitorBot(cfg, predictor, ui, rest_source=rest_source)
+    # журнал сигналов/позиций + советник (Этап 4)
+    if args.journal:
+        journal_path = Path(args.journal)
+    elif cfg.mode == "TEST":
+        journal_path = cfg.resolve("data/journal/journal_test.json")
+    else:
+        journal_path = cfg.resolve(cfg.journal.path)
+    try:
+        journal = Journal(journal_path)
+    except JournalError as e:
+        log.error("%s", e)
+        return 2
+    er = cfg.positions.exit_rules
+    default_rules = {
+        "take_profit_pct": er.take_profit_pct,
+        "stop_loss_pct": er.stop_loss_pct,
+        "max_hold_bars": er.max_hold_bars,
+    }
+    advisor = PositionAdvisor(journal, default_exit_rules=default_rules,
+                              interval_step_ms=step_ms_approx(cfg.exchange.interval))
+    log.info("Журнал: %s", journal_path)
+    if not any(v is not None for v in default_rules.values()):
+        log.info("Условия выхода в конфиге НЕ заданы: рекомендации на вход будут воздерживаться "
+                 "(задайте positions.exit_rules или --tp/--sl/--max-hold при регистрации позиции).")
+
+    bot = MonitorBot(cfg, predictor, ui, rest_source=rest_source, journal=journal, advisor=advisor)
 
     if cfg.mode == "TEST":
         replay = Path(args.replay_file) if args.replay_file else find_replay_file(cfg)
