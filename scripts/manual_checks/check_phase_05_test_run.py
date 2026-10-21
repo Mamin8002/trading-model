@@ -131,10 +131,14 @@ def json_response(status: int, payload: Any) -> HttpResponse:
 
 
 def auth_pair() -> list[HttpResponse]:
+    # expires_at — ДИНАМИЧЕСКИЙ (now + 15 мин): с фиксированной датой проверки
+    # начали бы падать после её истечения (клиент перевыпускает токен по
+    # реальному времени и ломает последовательность подменных ответов).
+    expires = (datetime.now(timezone.utc) + timedelta(minutes=15)).strftime("%Y-%m-%dT%H:%M:%SZ")
     return [
         json_response(200, {"token": FAKE_ACCESS_KEY}),
         json_response(200, {"account_ids": [FAKE_ACCOUNT_ID], "readonly": False,
-                            "expires_at": "2026-10-21T12:15:00Z"}),
+                            "expires_at": expires}),
     ]
 
 

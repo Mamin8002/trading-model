@@ -4,6 +4,11 @@
 (Finam Trade API), свечи OHLCV, таймфреймы **1m / 5m / 10m / 15m / 1h**, табличные
 признаки и градиентный бустинг (LightGBM).
 
+> **Новичкам:** начните с [docs/user-guide.md](docs/user-guide.md) — краткое
+> руководство простым языком (установка, CSV-данные, запуск TEST, чтение
+> результатов, частые ошибки, безопасность LIVE). LIVE-торговля не реализована
+> и не проверена — только TEST-симуляция на истории.
+
 Проектные документы (читать в этом порядке):
 
 1. [docs/research.md](docs/research.md) — исследование Finam Trade API и референсного
@@ -144,7 +149,8 @@ python -m tradebot test --config configs\test_pipeline_example.yaml --timeframe 
 ```
 
 Пошаговое руководство (установка → CSV → обучение → отчёт → симуляция →
-секреты) — [docs/user_guide.md](docs/user_guide.md).
+секреты) — [docs/user_guide.md](docs/user_guide.md); упрощённая версия для
+читателей без технического опыта — [docs/user-guide.md](docs/user-guide.md).
 
 Необязательная read-only проверка реального Finam API (потребует ваш secret_key;
 автоматически не запускается) — `python -m tradebot.cli.smoke_readonly` или
@@ -189,7 +195,7 @@ configs/         # example, demo, ml_example, sim_demo, test_pipeline_example, l
 data/demo/       # СИНТЕТИЧЕСКИЕ демонстрационные CSV
 scripts/manual_checks/  # ручные проверки фаз 0-2, 3, 4 и 5 (все офлайн)
 tests/           # юнит- и интеграционные тесты (Finam — только подменный транспорт)
-docs/            # проектные документы + user_guide.md + live.md
+docs/            # проектные документы + user-guide.md (для новичков) + user_guide.md + live.md
 models/, reports/ # артефакты обучения/прогонов (исключены из git)
 ```
 
