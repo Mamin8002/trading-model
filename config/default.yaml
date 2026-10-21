@@ -1,0 +1,38 @@
+# Конфигурация бота мониторинга BTC (Bybit, public data only).
+# Секреты не требуются и нигде не используются: бот работает только
+# с публичными рыночными данными. Не добавляйте сюда API-ключи.
+
+# TEST  - офлайн-прогон на сохранённых данных и демонстрационных сценариях
+# LIVE  - публичные данные Bybit в реальном времени (WebSocket)
+mode: TEST
+
+exchange:
+  source: bybit            # интерфейс MarketDataSource позволяет добавить другие биржи
+  category: spot           # spot | linear | inverse (по документации Bybit v5)
+  symbol: BTCUSDT          # только uppercase
+  interval: "5"            # код интервала Bybit: 1,3,5,15,30,60,120,240,360,720,D,W,M
+  rest_base_url: https://api.bybit.com
+  ws_public_url: wss://stream.bybit.com/v5/public/spot
+  request_timeout_s: 15
+  min_request_interval_s: 0.35   # троттлинг REST: ~3 req/s (IP-лимит Bybit 600 req/5s)
+  max_retries: 5
+
+model:
+  algorithm: xgboost       # по выводу исходного репозитория: XGBoost лучший на 5-min данных
+  horizon_bars: 1          # на сколько баров вперёд смотреть (1 бар = 5 минут при interval=5)
+  confidence_threshold: 0.55   # ниже порога -> HOLD/воздержание от рекомендации
+  random_seed: 42
+
+data:
+  history_start: "2024-01-01"  # начало истории для загрузки/обучения (UTC)
+  raw_dir: data/raw
+  processed_dir: data/processed
+  models_dir: data/models
+
+signals:
+  stale_after_intervals: 3     # нет обновлений дольше N*interval -> данные устарели (STALE),
+                               # новый сигнал не выдаётся, рекомендации по позиции не выдаются
+  history_display_bars: 10     # сколько последних свечей показывать в консоли
+
+journal:
+  path: data/journal/journal.json   # история сигналов + ручные позиции (переживает перезапуск)

@@ -1,0 +1,13 @@
+# BTC Bybit monitor bot - core dependencies
+# Совместимо с pandas 2.2+ и 3.x, Python 3.10+
+pandas>=2.2,<4.0
+numpy>=1.26,<3.0
+scikit-learn>=1.4,<2.0
+xgboost>=2.0,<4.0
+requests>=2.31
+websockets>=12.0
+joblib>=1.3
+PyYAML>=6.0
+
+# для unit-тестов (не обязательно для запуска бота)
+pytest>=8.0
