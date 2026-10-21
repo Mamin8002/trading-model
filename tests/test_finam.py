@@ -426,6 +426,9 @@ class TestMasking:
         masker.register("abc123", label="SECRET_KEY")
         assert masker.mask("token abc123 leaked") == "token ***SECRET_KEY*** leaked"
         assert masker.mask("no secrets here") == "no secrets here"
+        # короткие значения не регистрируются (иначе маскировка портит обычный текст)
+        masker.register("x", label="SECRET")
+        assert masker.mask("max_position_exceeded") == "max_position_exceeded"
 
 
 class TestRateLimiter:

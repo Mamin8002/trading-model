@@ -31,11 +31,16 @@ class SecretNotFound(RuntimeError):
 class SecretMasker:
     """Реестр секретных значений для маскирования в тексте/логах."""
 
+    #: значения короче этой длины не регистрируются: одно-двухсимвольные «секреты»
+    #: маскировали бы обычный текст (логи/журналы) до нечитаемости. Реальные
+    #: secret_key/access_key значительно длиннее.
+    MIN_REGISTERED_LENGTH = 4
+
     def __init__(self) -> None:
         self._values: dict[str, str] = {}
 
     def register(self, value: str, label: str = "SECRET") -> None:
-        if value:
+        if value and len(value) >= self.MIN_REGISTERED_LENGTH:
             self._values[value] = f"***{label}***"
 
     def mask(self, text: str) -> str:

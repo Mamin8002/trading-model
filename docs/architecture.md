@@ -178,6 +178,12 @@ live:                       # используется только в mode: LIV
 
 ## 4. Потоки данных
 
+> Статус (фаза 4): модули `execution/` (RiskGuards, sizing, SimulatedBroker,
+> журнал), `backtest/` (EventSimulator, results) и `strategy/` (источники
+> сигналов) реализованы для TEST-режима; LIVE-шлюзы (`FinamBroker`,
+> kill-switch-файл, reconciliation с брокером) остаются этапом L3. Семантика
+> симулятора, рисковых гейтов и журнала — docs/simulation.md.
+
 ### 4.1 TEST (обучение и симуляция)
 
 ```

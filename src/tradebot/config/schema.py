@@ -342,6 +342,133 @@ class EvaluationConfig(BaseModel):
     risk_free_annual: float = Field(default=0.0, ge=0.0, le=0.5)
 
 
+class RiskConfig(BaseModel):
+    """Правила риск-контроля фазы 4 (docs/simulation.md §3).
+
+    НИКАКИХ скрытых финансовых значений по умолчанию: все лимиты — None.
+    Поведение при неза заданном значении (требование ТЗ фазы 4):
+    - параметры сайзинга (position_units ИЛИ risk_per_trade_*): расчёт размера
+      позиции БЕЗОПАСНО ОТКЛАДЫВАЕТСЯ (отказ с кодом RISK_PARAM_NOT_SET);
+    - лимиты (max_position_units, daily_loss_limit_quote, max_drawdown_pct,
+      max_orders_per_day, max_data_age_seconds): проверка, которой не хватает
+      параметра, отказывает во входе с тем же кодом — лимит нельзя «молча
+      пропустить».
+    initial_capital_quote обязателен для запуска симулятора (проверяется при старте).
+    """
+
+    model_config = _STRICT
+
+    #: стартовый капитал в валюте котировки — ЯВНОЕ значение, дефолта нет
+    initial_capital_quote: float | None = Field(default=None, gt=0.0)
+    #: режим фиксированного размера: единиц инструмента на сделку (в штуках)
+    position_units: int | None = Field(default=None, ge=1)
+    #: рисковый режим: максимальный убыток на сделку в валюте котировки
+    #: (требует стоп-цену в сигнале; размер = risk / (entry - stop) с округлением до лота)
+    risk_per_trade_quote: float | None = Field(default=None, gt=0.0)
+    #: альтернатива: процент от текущего капитала (взаимоисключительно с _quote)
+    risk_per_trade_pct: float | None = Field(default=None, gt=0.0, le=100.0)
+    #: максимальная позиция в штуках
+    max_position_units: int | None = Field(default=None, ge=0)
+    #: максимум заявок (входов) на локальный торговый день
+    max_orders_per_day: int | None = Field(default=None, ge=1)
+    #: дневной лимит убытка в валюте котировки (положительное число = размер лимита)
+    daily_loss_limit_quote: float | None = Field(default=None, gt=0.0)
+    #: предел просадки капитала от пика, %
+    max_drawdown_pct: float | None = Field(default=None, gt=0.0, le=100.0)
+    #: максимальный возраст данных на момент решения, секунды
+    max_data_age_seconds: float | None = Field(default=None, gt=0.0)
+    #: короткие позиции запрещены по умолчанию (явный флаг)
+    allow_short: bool = False
+    #: при нарушении дневного лимита/просадки — полная остановка стратегии (True),
+    #: а не только отказ очередной заявки
+    halt_on_limit_breach: bool = True
+
+    @model_validator(mode="after")
+    def _sizing_unambiguous(self) -> "RiskConfig":
+        modes = [
+            self.position_units is not None,
+            self.risk_per_trade_quote is not None,
+            self.risk_per_trade_pct is not None,
+        ]
+        if sum(modes) > 1:
+            raise ValueError(
+                "Задайте РОВНО ОДИН режим размера позиции: position_units (фиксированный) "
+                "или risk_per_trade_quote/risk_per_trade_pct (рисковый). Двусмысленность запрещена"
+            )
+        return self
+
+
+class InstrumentConfig(BaseModel):
+    """Параметры инструмента для проверок шага цены и лота (фаза 4).
+
+    Значения должны происходить ИЗ ПОДТВЕРЖДЁННОГО источника: документированные
+    поля Finam GetAsset/GetAssetParams (min_step, decimals, lot_size,
+    trade_lot_size — docs/research.md S3d) или спецификация биржи. Выдумывать
+    параметры запрещено (ТЗ фазы 4); None = параметр не подтверждён — зависимая
+    проверка безопасно откладывается и это фиксируется в журнале/отчёте.
+    """
+
+    model_config = _STRICT
+
+    #: шаг цены в валюте котировки (= min_step / 10^decimals у Finam)
+    price_step: float | None = Field(default=None, gt=0.0)
+    #: штук в лоте (Finam lot_size / trade_lot_size; 0 у Finam = «недоступно»)
+    lot_size_units: int | None = Field(default=None, ge=1)
+    #: валюта котировки — только для отчётов/журнала
+    quote_currency: str | None = Field(default=None, min_length=3, max_length=8)
+
+
+class SignalConfig(BaseModel):
+    """Параметры преобразования модельного прогноза в сигналы (docs/simulation.md §2)."""
+
+    model_config = _STRICT
+
+    #: вход при proba >= entry_threshold (нейтральный дефолт 0.5 — не финансовая величина)
+    entry_threshold: float = Field(default=0.5, gt=0.0, lt=1.0)
+    #: выход при proba <= exit_threshold; None = выход только по стопу/цели/концу данных
+    exit_threshold: float | None = Field(default=None, gt=0.0, lt=1.0)
+    #: стоп/цель в базисных пунктах от цены входа; None = без стопа/цели.
+    #: Это ЯВНЫЕ стратегические параметры пользователя, не скрытые допущения.
+    stop_bps: float | None = Field(default=None, gt=0.0, le=5000.0)
+    target_bps: float | None = Field(default=None, gt=0.0, le=20000.0)
+
+    @model_validator(mode="after")
+    def _thresholds_consistent(self) -> "SignalConfig":
+        if self.exit_threshold is not None and self.exit_threshold >= self.entry_threshold:
+            raise ValueError(
+                f"exit_threshold ({self.exit_threshold}) должен быть строго меньше "
+                f"entry_threshold ({self.entry_threshold})"
+            )
+        return self
+
+
+class SimulationConfig(BaseModel):
+    """Параметры TEST-симулятора исполнения (docs/simulation.md).
+
+    commission_bps и slippage_bps ОБЯЗАТЕЛЬНЫ для запуска симуляции (проверяется
+    при старте движка): выдуманные издержки запрещены (ТЗ фазы 4) — значения
+    задаёт пользователь и они печатаются в допущениях отчёта.
+    """
+
+    model_config = _STRICT
+
+    #: комиссия, б.п. от оборота сделки (None = симуляция не запускается)
+    commission_bps: float | None = Field(default=None, ge=0.0, le=1000.0)
+    #: минимальная комиссия на сделку в валюте котировки (None = без минимума)
+    commission_min_quote: float | None = Field(default=None, ge=0.0)
+    #: проскальзывание, б.п. — применяется НЕВЫГОДНОЙ стороной к каждой симулируемой
+    #: цене исполнения (None = симуляция не запускается)
+    slippage_bps: float | None = Field(default=None, ge=0.0, le=1000.0)
+    #: правило конфликта «стоп и цель в одной свече» (docs/simulation.md §4):
+    #: stop_first — консервативное (исполняем стоп); require_intrabar_data —
+    #: остановка симуляции с требованием внутрибарных данных. Выгодный сценарий
+    #: автоматически НЕ выбирается никогда.
+    conflict_policy: Literal["stop_first", "require_intrabar_data"] = "stop_first"
+    signal: SignalConfig = Field(default_factory=SignalConfig)
+    #: путь JSONL-журнала решений/сделок (None = report_dir/journal_<experiment>_<tf>.jsonl)
+    journal_path: str | None = None
+
+
 class FinamConfig(BaseModel):
     """Настройки read-only адаптера Finam Trade API (docs/research.md §2).
 
@@ -385,6 +512,12 @@ class AppConfig(BaseModel):
     features: FeaturesConfig = Field(default_factory=FeaturesConfig)
     model: ModelConfig = Field(default_factory=ModelConfig)
     evaluation: EvaluationConfig = Field(default_factory=EvaluationConfig)
+    #: фаза 4: риск-контроль, параметры инструмента, TEST-симулятор (docs/simulation.md).
+    #: Все три секции опциональны для совместимости с конфигами фаз 0-3;
+    #: симулятор при их отсутствии не запускается и требует явной конфигурации.
+    risk: RiskConfig | None = None
+    instrument: InstrumentConfig | None = None
+    simulation: SimulationConfig | None = None
 
     @field_validator("timeframes")
     @classmethod

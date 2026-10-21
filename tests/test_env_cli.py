@@ -67,10 +67,13 @@ class TestResolveSecret:
         assert masker.mask("leak s3cr3t-fake-value here") == "leak ***SECRET*** here"
 
     def test_resolve_optional(self, monkeypatch):
+        # локальный маскировщик: не загрязняем GLOBAL_MASKER между тестами
+        masker = SecretMasker()
         monkeypatch.delenv("FAKE_OPT", raising=False)
-        assert resolve_optional("FAKE_OPT") is None
-        monkeypatch.setenv("FAKE_OPT", "x")
-        assert resolve_optional("FAKE_OPT") == "x"
+        assert resolve_optional("FAKE_OPT", masker=masker) is None
+        monkeypatch.setenv("FAKE_OPT", "fake-optional-value")
+        assert resolve_optional("FAKE_OPT", masker=masker) == "fake-optional-value"
+        assert masker.mask("leak fake-optional-value") == "leak ***SECRET***"
 
 
 class TestCliValidateData:
