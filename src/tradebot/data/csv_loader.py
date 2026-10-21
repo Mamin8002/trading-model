@@ -1,17 +1,20 @@
-"""Загрузчик исторических CSV формата MOEX-выгрузок (docs/data.md).
+"""Загрузчик исторических OHLCV-CSV криптовалютных выгрузок (docs/data.md).
 
-Формат (подтверждён контрактом ТЗ и прецедентом WISEPLAT, docs/research.md S9h):
+Формат (контракт проекта; совместим с экспортом свечей популярных криптобирж,
+например выгрузками Binance Vision после переименования колонок):
 
     datetime,open,high,low,close,volume
-    2021-01-04 10:00:00,274.67,274.67,274.67,274.67,123460
+    2024-01-03 18:00:00,42150.5,42210.0,42100.1,42180.2,123.456
 
 Правила:
 - колонки — ровно требуемый набор (порядок колонок не важен);
-- ``datetime`` — naive-метка в локальной таймзоне источника (по умолчанию
-  Europe/Moscow) либо ISO-метка со смещением; семантика метки задаётся ЯВНО
+- ``datetime`` — naive-метка в таймзоне источника (по умолчанию UTC: криптобиржи
+  отдают свечи в UTC, это однозначное соглашение проекта — docs/data.md §2) либо
+  ISO-метка со смещением; семантика метки задаётся ЯВНО
   (``timestamp_semantics``: bar_open | bar_close) и нормализуется к bar_open;
 - числа — только точка как десятичный разделитель, без разделителей тысяч;
-- volume — целое неотрицательное число штук;
+- volume — неотрицательное число; дробные значения РАЗРЕШЕНЫ (объём криптопар
+  в базовом активе обычно дробный — docs/decisions.md D13);
 - результат — список ``Bar`` (UTC, bar_open) + ``ValidationReport``;
   при наличии ошибок загрузка бросает ``DataValidationError`` (никакой тихой починки:
   данные не сортируются и не дедуплицируются молча — ошибки нужно исправить в источнике).
@@ -47,7 +50,7 @@ __all__ = [
 REQUIRED_COLUMNS: tuple[str, ...] = ("datetime", "open", "high", "low", "close", "volume")
 
 _PRICE_RE = re.compile(r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$")
-_VOLUME_RE = re.compile(r"^[+-]?\d+(?:\.0*)?$")
+_VOLUME_RE = re.compile(r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$")
 
 
 class _PriceNotPositiveError(ValueError):
@@ -90,13 +93,16 @@ def _parse_price(raw: str) -> float:
     return number
 
 
-def _parse_volume(raw: str) -> int:
+def _parse_volume(raw: str) -> float:
     value = raw.strip()
     if not _VOLUME_RE.match(value):
         raise ValueError(
-            f"объём должен быть целым неотрицательным числом штук, получено {raw!r}"
+            f"объём должен быть неотрицательным числом (допускается дробный — "
+            f"единицы базового актива), получено {raw!r}"
         )
-    number = int(float(value))
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(f"объём не конечен: {raw!r}")
     if number < 0:
         raise ValueError(f"объём не может быть отрицательным: {raw!r}")
     return number
@@ -126,7 +132,7 @@ def load_csv(
     *,
     timeframe: "Timeframe | str",
     symbol: str = "",
-    source_timezone: str = "Europe/Moscow",
+    source_timezone: str = "UTC",
     timestamp_semantics: Literal["bar_open", "bar_close"] = "bar_open",
     calendar: SessionCalendar | None = None,
     warn_zero_volume: bool = True,

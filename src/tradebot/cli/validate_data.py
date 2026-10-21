@@ -84,8 +84,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--symbol", default="", help="символ (по умолчанию пустой)")
     parser.add_argument(
         "--source-timezone",
-        default="Europe/Moscow",
-        help="таймзона naive-меток CSV (по умолчанию Europe/Moscow)",
+        default="UTC",
+        help="таймзона naive-меток CSV (по умолчанию UTC — соглашение крипторынка, docs/data.md)",
     )
     parser.add_argument(
         "--timestamp-semantics",

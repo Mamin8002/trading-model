@@ -7,7 +7,7 @@
 Сценарий ПОЛНОСТЬЮ ЛОКАЛЬНЫЙ:
 - данные — СИНТЕТИЧЕСКИЙ детерминированный набор (tradebot.data.synthetic),
   внешние загрузки и сеть не используются;
-- секреты и Finam API не задействуются (торговые операции в проекте не реализованы);
+- секреты и сеть не задействуются (торговые операции в проекте не реализованы);
 - артефакты создаются в models/phase03_manual/ и reports/phase03_manual/
   (оба каталога исключены из git); в конце печатается список созданных файлов.
 
@@ -74,9 +74,9 @@ CONFIG_DICT: dict[str, Any] = {
     "run": {"mode": "TEST", "experiment_id": "phase03-manual", "model_dir": "models/phase03_manual", "report_dir": "reports/phase03_manual"},
     "data": {
         "csv_dir": "data/raw",
-        "symbols": [{"ticker": "SYNTH", "mic": "DEMO", "files": {}}],
+        "symbols": [{"ticker": "SYNTH-USDT", "files": {}}],
         "timestamp_semantics": "bar_open",
-        "source_timezone": "Europe/Moscow",
+        "source_timezone": "UTC",
     },
     "timeframes": {
         "5m": {
@@ -105,7 +105,7 @@ def make_config() -> AppConfig:
     return AppConfig.model_validate(json.loads(json.dumps(CONFIG_DICT)))
 
 
-BARS = generate_synthetic_bars(2600, seed=7, timeframe="5m", symbol="SYNTH@DEMO")
+BARS = generate_synthetic_bars(2600, seed=7, timeframe="5m", symbol="SYNTH-USDT")
 HORIZON = 6
 
 
@@ -125,7 +125,7 @@ def _track_created(path: "str | Path") -> None:
 
 @check("Синтетический набор детерминирован (один seed -> идентичные бары)")
 def check_synthetic_determinism() -> str | None:
-    again = generate_synthetic_bars(2600, seed=7, timeframe="5m", symbol="SYNTH@DEMO")
+    again = generate_synthetic_bars(2600, seed=7, timeframe="5m", symbol="SYNTH-USDT")
     expect(len(again) == len(BARS) == 2600, "число баров не совпало")
     for a, b in zip(BARS[:50], again[:50]):
         expect((a.ts_open, a.open, a.high, a.low, a.close, a.volume) == (b.ts_open, b.open, b.high, b.low, b.close, b.volume),
@@ -136,7 +136,7 @@ def check_synthetic_determinism() -> str | None:
 @check("Признаки v1: 31 колонка, warmup, значения после прогрева без NaN")
 def check_features_basic() -> str | None:
     spec = FeatureSpec.from_config(FeaturesConfig())
-    frame = FeatureBuilder(spec, local_timezone="Europe/Moscow").build(BARS)
+    frame = FeatureBuilder(spec, local_timezone="UTC").build(BARS)
     expect(len(frame.columns) == 31, f"колонок: {len(frame.columns)}")
     expect(list(frame.columns) == list(spec.feature_names), "порядок колонок не совпадает с манифестом")
     expect(frame.iloc[: spec.warmup_bars].isna().any().any(), "в warmup-зоне ожидались NaN")
@@ -150,7 +150,7 @@ def check_features_basic() -> str | None:
 @check("Причинность: префикс-инвариантность + возмущение будущего не меняют признаки в t")
 def check_features_causality() -> str | None:
     spec = FeatureSpec.from_config(FeaturesConfig())
-    builder = FeatureBuilder(spec, local_timezone="Europe/Moscow")
+    builder = FeatureBuilder(spec, local_timezone="UTC")
     full = builder.build(BARS)
     # 1) обрезанная серия даёт те же значения в прошлых строках
     for cut in (spec.warmup_bars + 20, 800, len(BARS) - 25):
@@ -206,7 +206,7 @@ def check_dataset() -> str | None:
         lookback_bars=240,
         label_cfg=LabelConfig(kind="fwd_return_class", neutral_band_bps=5.0),
         features_cfg=FeaturesConfig(),
-        symbol="SYNTH@DEMO",
+        symbol="SYNTH-USDT",
     )
     expect(np.isfinite(dataset.X).all(), "X содержит NaN/inf")
     expect(dataset.X.shape[1] == 31, "ширина X != 31")
@@ -235,7 +235,7 @@ def check_splits() -> str | None:
     dataset = assemble_dataset(
         BARS, timeframe="5m", horizon_bars=HORIZON, lookback_bars=240,
         label_cfg=LabelConfig(kind="fwd_return_class", neutral_band_bps=5.0),
-        features_cfg=FeaturesConfig(), symbol="SYNTH@DEMO",
+        features_cfg=FeaturesConfig(), symbol="SYNTH-USDT",
     )
     folds = purged_walk_forward(dataset.n_samples, n_splits=3, horizon_bars=HORIZON,
                                 min_train_bars=500, min_val_bars=100)
@@ -428,7 +428,7 @@ def check_registry() -> str | None:
             expect(len(exc.mismatches) >= 1, "пустой список расхождений")
         else:
             raise AssertionError(f"несовместимый контекст принят: {label}")
-    proba = bundle.predict_proba(BARS[100:180], local_timezone="Europe/Moscow")
+    proba = bundle.predict_proba(BARS[100:180], local_timezone="UTC")
     expect(proba.shape == (80,), f"shape прогноза: {proba.shape}")
     expect(bool(np.isfinite(proba).all()) and bool(((proba >= 0) & (proba <= 1)).all()), "прогноз вне [0,1]")
     return "совместимость проверяется; 4 вида несоответствий отклонены; predict_proba работает"

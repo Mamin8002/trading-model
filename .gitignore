@@ -1,4 +1,4 @@
-# Секреты — никогда не коммитить (docs/research.md S3b, S4)
+# Секреты — никогда не коммитить (правила обращения: docs/user-guide.md §7, config/env.py)
 .env
 .env.*
 !.env.example

@@ -30,7 +30,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="train", description="Обучение модели на walk-forward")
     parser.add_argument("--config", required=True, help="путь к YAML-конфигу")
     parser.add_argument("--timeframe", required=True, choices=SUPPORTED_TIMEFRAMES)
-    parser.add_argument("--symbol", default=None, help="ticker или ticker@mic (по умолчанию — единственный в конфиге)")
+    parser.add_argument("--symbol", default=None, help="символ пары, например BTCUSDT (по умолчанию — единственный в конфиге)")
     parser.add_argument("--model-dir", default=None, help="переопределить run.model_dir")
     parser.add_argument("--report-dir", default=None, help="переопределить run.report_dir")
     args = parser.parse_args(argv)

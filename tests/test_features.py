@@ -37,7 +37,7 @@ def bars() -> list[Bar]:
 
 @pytest.fixture(scope="module")
 def frame(spec, bars) -> pd.DataFrame:
-    return FeatureBuilder(spec, local_timezone="Europe/Moscow").build(bars)
+    return FeatureBuilder(spec, local_timezone="UTC").build(bars)
 
 
 class TestSpec:
@@ -88,12 +88,12 @@ class TestBuilder:
         assert not np.isinf(values[~np.isnan(values)]).any()
 
     def test_time_features_local_timezone(self, spec):
-        # бар в 07:00 UTC = 10:00 Europe/Moscow, четверг (weekday=3)
+        # бар в 07:00 UTC, четверг (weekday=3); временные признаки — в UTC
         bar_ts = datetime(2024, 1, 4, 7, 0, tzinfo=UTC)
         bars = generate_synthetic_bars(80, seed=3, start=bar_ts, timeframe="5m")
-        frame = FeatureBuilder(spec, local_timezone="Europe/Moscow").build(bars)
+        frame = FeatureBuilder(spec, local_timezone="UTC").build(bars)
         first = frame.iloc[0]
-        local = bars[0].ts_open.astimezone(ZoneInfo("Europe/Moscow"))
+        local = bars[0].ts_open.astimezone(ZoneInfo("UTC"))
         assert first["minute_of_day"] == local.hour * 60 + local.minute
         assert first["day_of_week"] == float(local.weekday())
 
@@ -102,7 +102,7 @@ class TestCausality:
     """Критерий приёмки: признаки в момент t не используют данные позже t."""
 
     def test_prefix_invariance(self, spec, bars, frame):
-        builder = FeatureBuilder(spec, local_timezone="Europe/Moscow")
+        builder = FeatureBuilder(spec, local_timezone="UTC")
         for cut in (spec.warmup_bars + 5, spec.warmup_bars + 60, len(bars) - 37):
             prefix_frame = builder.build(bars[:cut])
             common = frame.iloc[:cut]
@@ -115,7 +115,7 @@ class TestCausality:
             )
 
     def test_future_perturbation_does_not_change_past_features(self, spec, bars, frame):
-        builder = FeatureBuilder(spec, local_timezone="Europe/Moscow")
+        builder = FeatureBuilder(spec, local_timezone="UTC")
         rng = np.random.RandomState(5)
         for t in (spec.warmup_bars + 2, 150, len(bars) - 30):
             perturbed = list(bars)
@@ -138,7 +138,7 @@ class TestCausality:
             )
 
     def test_appending_future_bars_keeps_history(self, spec, bars, frame):
-        builder = FeatureBuilder(spec, local_timezone="Europe/Moscow")
+        builder = FeatureBuilder(spec, local_timezone="UTC")
         extended = builder.build(list(bars) + generate_synthetic_bars(50, seed=99, start=bars[-1].ts_open + timedelta(minutes=5), timeframe="5m"))
         pd.testing.assert_frame_equal(
             extended.iloc[: len(bars)], frame, check_exact=False, rtol=1e-12, atol=1e-12

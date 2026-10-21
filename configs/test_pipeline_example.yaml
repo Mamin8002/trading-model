@@ -1,0 +1,98 @@
+# ПРИМЕР конфигурации ПОЛНОГО TEST-пути (единая команда запуска), крипторежим:
+#   python -m tradebot test --config configs\test_pipeline_example.yaml --timeframe 5m --train
+#   python -m tradebot test --config configs\test_pipeline_example.yaml --timeframe 5m --model-dir models\<артефакт>
+#
+# Объединяет: данные (CSV/ресэмплинг) -> признаки/обучение (docs/ml.md) ->
+# риск-контроль и симулятор (docs/simulation.md) -> отчёт + журнал. Работает
+# офлайн на локальных CSV. ЗАМЕНИТЕ заглушки файлов и демо-значения своими;
+# все финансовые параметры — ЯВНЫЕ допущения пользователя (скрытые значения
+# не подставляются). Подключение к бирже НЕ реализовано (docs/live.md).
+
+run:
+  mode: TEST                 # команда test отказывается работать с mode: LIVE
+  experiment_id: pipeline-example
+  model_dir: models
+  report_dir: reports
+
+data:
+  csv_dir: data/raw          # каталог ваших CSV (формат: docs/data.md)
+  symbols:
+    - ticker: BTCUSDT
+      files:
+        "1m": BTCUSDT_M1.csv    # заглушки — положите свои файлы
+        "5m": BTCUSDT_M5.csv
+  timestamp_semantics: bar_open   # подтвердите по вашим данным (docs/data.md §2)
+  source_timezone: UTC            # криптобиржи отдают свечи в UTC
+  volume_units: base_asset
+
+timeframes:
+  "5m":
+    enabled: true
+    lookback_bars: 240
+    horizon_bars: 6
+    label: { kind: fwd_return_class, neutral_band_bps: 5.0 }
+  "10m":
+    enabled: false
+    base_timeframe: "5m"     # 10m строится локальным ресэмплингом (decisions D3)
+    lookback_bars: 120
+    horizon_bars: 3
+    label: { kind: fwd_return_class, neutral_band_bps: 6.0 }
+
+features:
+  set: v1
+
+model:
+  kind: lightgbm
+  seed: 42
+  params:
+    n_estimators: 300
+    learning_rate: 0.05
+    num_leaves: 31
+    min_child_samples: 50
+    early_stopping_holdout_bars: 0
+
+validation:
+  walk_forward:
+    n_splits: 5
+    embargo_bars: null       # null = авто (= horizon_bars)
+    min_train_bars: 1000
+    min_val_bars: 100
+    audit_random_split: true
+  thresholds:
+    min_oos_auc: 0.52        # диагностические пороги, фиксируются ДО обучения
+    min_oos_trades: 20
+
+evaluation:
+  commission_bps: 3.0        # ОЦЕНОЧНОЕ допущение (не фактическая комиссия биржи)
+  slippage_bps: 2.0
+  trading_days_per_year: 365 # крипторынок без выходных
+  bars_per_year: null        # null = вывести из данных
+
+risk:                        # ДЕМО-допущения — замените своими правилами
+  initial_capital_quote: 100000.0
+  position_units: null
+  risk_per_trade_quote: 500.0     # рисковый режим: требует stop_bps в simulation.signal
+  max_position_units: 100
+  max_orders_per_day: 10
+  daily_loss_limit_quote: 1500.0
+  max_drawdown_pct: 5.0
+  max_data_age_seconds: 3600
+  allow_short: false              # long-only; маржа/фьючерсы — отложенное решение (D15)
+  halt_on_limit_breach: true
+
+instrument:                  # значения — ИЗ ПОДТВЕРЖДЁННОГО источника (спецификация биржи)
+  price_step: null           # null -> проверки шага безопасно откладываются (warning в журнал)
+  lot_size_units: null
+  quote_currency: null
+
+simulation:
+  commission_bps: 3.0        # ДЕМО-допущение, не фактический тариф
+  commission_min_quote: 1.0
+  slippage_bps: 2.0
+  conflict_policy: stop_first   # консервативное правило конфликта стоп/цель (docs/simulation.md §4)
+  journal_path: null            # null -> report_dir/journal_<experiment>_<tf>.jsonl
+  signal:
+    entry_threshold: 0.55
+    exit_threshold: 0.45
+    stop_bps: 100.0
+    target_bps: 200.0

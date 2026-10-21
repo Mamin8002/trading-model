@@ -188,7 +188,7 @@ def _resolve_symbol(config: AppConfig, symbol: str | None):
     if symbol is None:
         if len(symbols) != 1:
             raise TrainingError(
-                "В конфиге несколько символов — укажите --symbol (ticker или ticker@mic)"
+                "В конфиге несколько символов — укажите --symbol (например BTCUSDT)"
             )
         return symbols[0]
     for cfg in symbols:
@@ -775,5 +775,5 @@ def _build_verdict(
         "checks": checks,
         "passed": passed,
         "baseline_comparison": baseline_comparison,
-        "text": text + ". Вердикт НЕ является утверждением о прибыльности (decisions D15)",
+        "text": text + ". Вердикт НЕ является утверждением о прибыльности (decisions D16)",
     }

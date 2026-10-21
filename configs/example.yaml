@@ -1,28 +1,30 @@
-# ПРИМЕР конфигурации (схема: src/tradebot/config/schema.py, docs/architecture.md §3.4).
-# Значения lookback_bars/horizon_bars — ОБЯЗАТЕЛЬНЫЕ и явные: ничего не подбирается
-# молча при запуске (требование ТЗ). Измените их под свою стратегию.
+# ПРИМЕР конфигурации крипторежима (схема: src/tradebot/config/schema.py,
+# docs/architecture.md §3.4). Значения lookback_bars/horizon_bars — ОБЯЗАТЕЛЬНЫЕ
+# и явные: ничего не подбирается молча при запуске. Измените их под свою стратегию.
 #
-# СЕКРЕТОВ В КОНФИГЕ НЕТ: secret_key и account_id читаются только из окружения
-# (имена переменных заданы в секции finam). См. .env.example.
+# СЕКРЕТОВ В КОНФИГЕ НЕТ. Подключение к криптобирже НЕ реализовано
+# (exchange/base.py): бот работает офлайн на локальных CSV, LIVE заблокирован.
+# Когда биржевой адаптер появится, API-ключи будут читаться только из окружения.
 
 run:
-  mode: TEST                # TEST | LIVE (LIVE-контур в этой фазе не реализован)
-  experiment_id: example-sber-5m-v1
+  mode: TEST                # LIVE в крипто-версии заблокирован гейтом (docs/live.md)
+  experiment_id: example-btcusdt-5m-v1
 
 data:
   csv_dir: data/raw         # подставьте свои CSV; формат описан в docs/data.md
   symbols:
-    - ticker: SBER
-      mic: MISX             # полный symbol = ticker@mic (требование Finam API)
+    - ticker: BTCUSDT       # торговая пара в формате вашей биржи (например BTCUSDT, BTC/USDT)
       files:
-        "1m": SBER_M1.csv   # имена файлов — ЗАГЛУШКИ-ПРИМЕРЫ; положите свои файлы в csv_dir
-        "5m": SBER_M5.csv
+        "1m": BTCUSDT_M1.csv   # имена файлов — ЗАГЛУШКИ-ПРИМЕРЫ; положите свои файлы в csv_dir
+        "5m": BTCUSDT_M5.csv
   # ЯВНАЯ семантика метки времени в ваших CSV: bar_open (метка = начало бара) или
-  # bar_close (метка = конец бара). Подтвердите её валидатором по граничным сессиям
-  # (docs/data.md, раздел "Время"; docs/research.md Q3).
+  # bar_close (метка = конец бара). Уточните в документации вашей выгрузки
+  # (docs/data.md, раздел "Время").
   timestamp_semantics: bar_open
-  source_timezone: Europe/Moscow
-  volume_units: pieces
+  source_timezone: UTC      # криптобиржи отдают свечи в UTC (docs/data.md §2);
+                            # если ваш экспорт в другой зоне — укажите её явно
+  volume_units: base_asset  # volume в единицах базового актива (BTC); у некоторых
+                            # выгрузок — quote_asset (USDT): проверьте и укажите верно
 
 # КАЖДЫЙ включённый таймфрейм обязан иметь явные lookback_bars и horizon_bars.
 timeframes:
@@ -35,8 +37,8 @@ timeframes:
       neutral_band_bps: 3.0
   "10m":
     enabled: true
-    base_timeframe: "5m"    # ОБЯЗАТЕЛЬНО для 10m: в Finam API нет TIME_FRAME_M10
-                            # (docs/research.md §2.3) — строим локально из 5m (decisions D3)
+    base_timeframe: "5m"    # ОБЯЗАТЕЛЬНО для 10m: нативных 10m-свечей биржи обычно
+                            # не отдают — строим локально из 5m (decisions D3)
     lookback_bars: 120      # ПРИМЕР
     horizon_bars: 3         # ПРИМЕР
     label:
@@ -51,29 +53,17 @@ timeframes:
     lookback_bars: 72
     horizon_bars: 2
 
-# Календарь сессий — ПРИМЕРНЫЕ окна; сверьте с фактическим расписанием биржи
-# (в LIVE — документированный метод Schedule). Без календаря пропуски считаются
-# по равномерной сетке, а разрывы сессий выглядят как warnings W_GAP.
+# Крипторынок работает 24/7 — календарь круглосуточный (окно 00:00-24:00 UTC
+# во все дни недели). Если у вашей биржи бывают техобслуживания/окна торгов —
+# опишите их здесь же. Секцию sessions можно не задавать: тогда пропуски
+# считаются по равномерной сетке, а разрывы выглядят как warnings W_GAP.
 sessions:
-  timezone: Europe/Moscow
+  timezone: UTC
   days:
-    - days: [0, 1, 2, 3, 4]     # пн-пт (0=понедельник)
+    - days: [0, 1, 2, 3, 4, 5, 6]   # 0=понедельник ... 6=воскресенье
       sessions:
-        - { start: "10:00", end: "18:50" }   # ПРИМЕР основного окна
-        - { start: "19:05", end: "23:50" }   # ПРИМЕР вечернего окна
+        - { start: "00:00", end: "24:00" }
 
 validation:
   max_reported_issues: 50
   warn_zero_volume: true
-
-finam:
-  base_url: https://api.finam.ru
-  timeout_seconds: 15.0
-  rate_limit_per_minute: 200    # документированный лимит: 200 запросов/мин НА МЕТОД
-  max_get_attempts: 4
-  secret_env_var: TRADE_API_SECRET
-  account_id_env_var: FINAM_ACCOUNT_ID
-  # Семантика timestamp свечей API документацией НЕ зафиксирована (research Q3).
-  # null = адаптер откажется нормализовать бары, пока вы явно не укажете значение
-  # после эмпирической проверки (cli.smoke_readonly --bar-timestamp-semantics ...).
-  bar_timestamp_semantics: null

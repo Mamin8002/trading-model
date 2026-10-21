@@ -1,7 +1,12 @@
-# Architecture: торговый бот на табличных признаках (MOEX CSV → Finam Trade API)
+# Architecture: торговый бот на табличных признаках (криптовалюты, локальные CSV)
 
-Статус: проектное решение до реализации. Дата: 2026-10-21. Код на этом этапе не пишется.
-Основание: факты и открытые вопросы — в [research.md](research.md); аргументация выборов — в [decisions.md](decisions.md); этапы — в [roadmap.md](roadmap.md).
+Статус: соответствует реализации. Дата редакции: 2026-10-21 (перевод в крипторежим).
+Аргументация выборов — [decisions.md](decisions.md); этапы — [roadmap.md](roadmap.md);
+данные — [data.md](data.md); LIVE-граница — [live.md](live.md).
+
+> **Ключевой факт**: подключение к криптобирже НЕ реализовано (`exchange/base.py`).
+> Работает только TEST-контур на локальных OHLCV-CSV; LIVE заблокирован
+> многофакторным гейтом. Сетевых зависимостей в проекте нет.
 
 ---
 
@@ -9,235 +14,147 @@
 
 ```
                 ┌────────────────────────────── РЕЖИМ TEST ──────────────────────────────┐
- CSV (MOEX)  →  │ DataLayer → Features → Labels → ML(train/validate) → Backtest/Simulator │
+ CSV (крипто,   │ DataLayer → Features → Labels → ML(train/validate) → Backtest/Simulator │
+ UTC, 24/7)  →  │                        → отчёт + JSONL-журнал                           │
                 └─────────────────────────────────────────────────────────────────────────┘
                                      │  (общие модули: Features, Labels, Strategy, Model artifacts)
                 ┌────────────────────────────── РЕЖИМ LIVE ──────────────────────────────┐
- Finam API   →  │ FinamMarketData (warmup+WS) → BarFinalizer → Features → Strategy        │
- (REST/WS/gRPC) │        → RiskGuards → BrokerGateway (dry-run | демо | real*)            │
+ биржа (БУДУЩЕЕ)│ ExchangeAdapter (НЕ реализован) → BarFinalizer → Features → Strategy     │
+                │        → RiskGuards → BrokerGateway — ВСЁ ЗА ГЕЙТОМ, сейчас недоступно │
                 └─────────────────────────────────────────────────────────────────────────┘
-                                            * real — вне области текущего этапа, только через явное решение
 ```
 
-Принцип TEST/LIVE-инвариантности: **один и тот же код** признаков, меток, модели и стратегии в обоих режимах. Различаются только два подключаемых слоя:
+Принцип TEST/LIVE-инвариантности: **один и тот же код** признаков, меток, модели и
+стратегии в обоих режимах. Различаются только два подключаемых слоя:
 
-| Слой | TEST | LIVE |
+| Слой | TEST (реализовано) | LIVE (будущее, НЕ реализовано) |
 |---|---|---|
-| `HistorySource` / `StreamSource` | CSV-replay (детерминированный) | Finam REST `Bars` (warmup) + WS/gRPC подписки |
-| `BrokerGateway` | `SimulatedBroker` (филлы по правилам бэктеста) | `FinamBroker` через `finam-sdk`, по умолчанию `DryRunBroker`-обёртка |
+| `HistorySource` / `StreamSource` | CSV-replay (детерминированный) | REST-история + WS-потоки адаптера биржи |
+| `BrokerGateway` | `SimulatedBroker` (филлы по правилам бэктеста) | ордерный шлюз адаптера биржи за LIVE-гейтом |
 
-Режимы задаются конфигурацией, а не ветвлением внутри модулей; переключение = замена фабрики шлюзов.
+Режимы задаются конфигурацией, а не ветвлением внутри модулей. Сейчас фабрика
+шлюзов LIVE физически отсутствует: `get_exchange_adapter()` всегда бросает
+`ExchangeNotImplemented`, а гейт имеет постоянное невыполненное условие №0.
 
 ---
 
 ## 2. Модули и их границы
 
-Каталог (предложение; имена финализируются на этапе 0):
-
 ```
 src/tradebot/
-├── config/        # схема конфига (pydantic), загрузка, валидация, хэш конфигурации
-├── data/          # контракт данных: Bar-типы, CSV loader+validator, resampler, session calendar, хранилище (parquet)
-├── features/      # библиотеки индикаторов и FeatureBuilder (окно lookback → вектор признаков)
-├── labels/        # построение целевой переменной (горизонт H)
-├── ml/            # DatasetAssembler, PurgedWalkForwardSplit, обучение (LightGBM/CatBoost), модельный реестр, отчёты оценки
-├── strategy/      # SignalPolicy (модель → торговое намерение), PositionManager (состояние позиции)
-├── backtest/      # EventSimulator, модель издержек/филлов, метрики, отчёты
-├── execution/     # интерфейсы BrokerGateway, OrderRequest/OrderState; DryRunBroker; SimulatedBroker; RiskGuards; KillSwitch
-├── marketdata/    # интерфейсы HistorySource/StreamSource/InstrumentsSource; CsvReplaySource; FinamHistorySource; FinamStreamSource; BarFinalizer
-├── finam/         # адаптер finam-sdk: AuthSession, клиенты, маппинг ошибок, rate limiter, reconciliation — ЕДИНСТВЕННОЕ место, знающее про SDK
-├── live/          # LiveOrchestrator: warmup → подписки → цикл сигналов → execution; журналирование состояния
-├── observability/ # структурированные логи (без секретов), метрики, алерты
-└── cli/           # точки входа: validate-data, build-dataset, train, backtest, live --dry-run
-tests/             # unit, property-based (причинность), контрактные (фейк-API), golden-фикстуры
-configs/           # YAML-конфиги (base + per-timeframe + per-mode)
+├── config/        # схема конфига (pydantic), загрузка, валидация, хэш, env-секреты (инфраструктура)
+├── data/          # контракт данных: Bar, CSV loader+validator, resampler, session calendar (24/7), синтетика
+├── features/      # библиотеки индикаторов и FeatureBuilder (окно lookback → вектор признаков v1)
+├── labels/        # построение целевой переменной (горизонт H, нейтральная полоса)
+├── ml/            # DatasetAssembler, PurgedWalkForwardSplit, обучение (LightGBM), реестр, метрики, отчёты
+├── strategy/      # SignalPolicy (модель → торговое намерение): ModelSignalSource
+├── backtest/      # прогон симуляции поверх execution, результаты, отчёты
+├── execution/     # интерфейсы (Signal/OrderIntent/BrokerGateway), RiskGuards, sizing, SimulatedBroker, JSONL-журнал
+├── marketdata/    # бирженезависимые порты: HistorySource/QuoteSnapshotSource/OrderBookSnapshotSource/StreamSource; CsvHistorySource
+├── exchange/      # ТОЧКА ПОДКЛЮЧЕНИЯ БИРЖИ: контракт ExchangeAdapter, статус EXCHANGE_INTEGRATION_AVAILABLE=False (реализаций нет)
+├── live/          # многофакторный LIVE-гейт (сейчас всегда отказывает); оркестратор — будущий этап
+└── cli/           # точки входа: python -m tradebot {test, live-preflight}; validate_data, train, simulate
+tests/             # unit, интеграционные (офлайн), гигиена репозитория
+configs/           # YAML-конфиги (демо + примеры крипторежима)
 docs/              # этот набор документов
-data/              # raw CSV, артефакты (вне git)
+data/              # CSV пользователя (raw) и демо-данные (demo/, синтетика)
+scripts/manual_checks/  # офлайн-сценарии ручной приёмки
 ```
 
 Правила границ:
-1. `features/`, `labels/`, `strategy/`, `ml/` **не знают** ни о CSV, ни о Finam, ни о режиме — работают только с внутренними типами `data/`.
-2. Всё знание о Finam Trade API (эндпоинты, enum-ы, decimal-конверсии, retry, reconciliation) изолировано в `finam/` + реализациях интерфейсов `marketdata/` и `execution/`. Открытые вопросы Q1–Q9 (research.md) закрыты этими интерфейсами.
-3. Стратегический расчёт отделён от транспорта — как в официальном примере SMA 9/30 (S8i) и Рецепте 6 (S3j): тестируется без токена и сети.
+1. `features/`, `labels/`, `strategy/`, `ml/` **не знают** ни о CSV, ни о бирже, ни о режиме — работают только с внутренними типами `data/`.
+2. Всё знание о конкретной бирже (эндпоинты, форматы, аутентификация, retry) должно быть изолировано в будущем адаптере `exchange/` за портами `marketdata/` и `execution/` (decisions D7). Сейчас такого кода нет вообще.
+3. Стратегический расчёт отделён от транспорта: тесты не требуют сети и ключей.
 4. Зависимости направлены внутрь: cli/live/backtest → strategy → features/labels → data. Обратных зависимостей нет.
+5. Ордерные операции физически отсутствуют в кодовой базе: гигиенические тесты блокируют появление торговых эндпоинтов вне будущего адаптера.
 
 ---
 
 ## 3. Контракт данных
 
-### 3.1 Входной CSV (внешний, от пользователя/MOEX)
+### 3.1 Входной CSV (внешний, от пользователя)
 
-```
-datetime,open,high,low,close,volume
-```
-
-- Формат полностью совпадает с CSV референсного проекта WISEPLAT (S9h) — это подтверждённый прецедент формата.
-- Обязательные метаданные (в конфиге, не в файле): `timestamp_semantics` (`bar_open` | `bar_close`), `timezone` (ожидание: naive Europe/Moscow для MOEX-выгрузок), `volume_units` (штуки), символ инструмента и таймфрейм файла.
-- **[РАСХОЖДЕНИЕ/Q3]**: у WISEPLAT скрипт генерации сдвигает метку на конец бара, а опубликованные CSV выглядят как метки начала сессии — семантика неоднозначна. Валидатор (этап D1) детектирует семантику эмпирически (границы сессий/аукционов, монотонность, отсутствие перекрытий) и требует подтверждения в конфиге. Внутренне всё нормализуется к `bar_open`, tz-aware UTC.
-- Валидация при загрузке: схема и типы колонок; монотонность и уникальность datetime; OHLC-соотношения (low ≤ open/close ≤ high); volume ≥ 0; пропуски против торгового календаря; дубликаты; аномалии (нулевые объёмы, разрывы цены) — отчёт, не тихая починка.
+- формат: `datetime,open,high,low,close,volume` (порядок колонок не важен, лишние/недостающие — ошибка);
+- `datetime`: naive-метка в `data.source_timezone` (по умолчанию **UTC** — стандарт криптоэкспортов) либо ISO-8601 со смещением; семантика метки задаётся ЯВНО (`timestamp_semantics: bar_open|bar_close`) и нормализуется к bar_open;
+- числа: только точка как десятичный разделитель; цены > 0; объём — неотрицательное число, **дробный объём разрешён** (decisions D13);
+- ничего не чинится молча: сортировка/дедупликация/интерполяция — ошибки валидации, а не автоисправления.
 
 ### 3.2 Внутреннее представление
 
-- `Bar`: `ts_open: datetime (UTC, tz-aware)`, `open/high/low/close: Decimal-совместимые float64`, `volume: int64`, `source: enum{csv,finam_rest,finam_ws,derived}` (derived — локальный ресэмплинг, добавлено при реализации фазы 0-2, см. docs/data.md §3), `is_final: bool`, `symbol: "TICKER@MIC"`.
-- Цены/объёмы в признаках — float64 (для ML); **в контуре заявок — только Decimal/строки** (требование API: бинарный float запрещён для цены заявки, S3c/S4). Конвертация — на границе `execution/`.
-- Свечи Finam API (REST decimal-объекты `{"value": "..."}`, WS-строки, gRPC `google.type.Decimal`) нормализуются к одному типу в `finam/` — модели ответов между протоколами не переносимы (S3f).
-- Хранилище обработанных данных: parquet-партиции по symbol/timeframe; каждый артефакт сопровождается манифестом (хэш конфига, границы окна, версия кода, семантика метки).
+- `Bar`: `ts_open` (UTC, bar_open), OHLC — float, `volume` — float ≥ 0, `source` (csv | exchange_rest | exchange_ws | derived — последние два зарезервированы за будущим адаптером), `is_final`, `symbol`.
+- артефакты (модель/отчёты/датасет) именуются с хэшем конфига (`config_hash`): одинаковый конфиг → одинаковый хэш; каталоги `models/`, `reports/` вне git.
 
 ### 3.3 Таймфреймы и ресэмплинг
 
-Поддержка: **1m, 5m, 10m, 15m, 1h** (ТЗ).
-
-| ТФ | Источник TEST | Источник LIVE |
-|---|---|---|
-| 1m | CSV 1m | API TIME_FRAME_M1 (глубина 7 дней) / WS BARS M1 |
-| 5m | CSV 5m | TIME_FRAME_M5 (30 дней) / WS BARS M5 |
-| **10m** | CSV 10m **или ресэмплинг 5m→10m** | **только ресэмплинг** (M10 в API нет — R1/Q, подтверждено enum-ом TimeFrame) |
-| 15m | CSV 15m | TIME_FRAME_M15 / WS BARS M15 |
-| 1h | CSV 1h | TIME_FRAME_H1 / WS BARS H1 |
-
-- Единственный модуль `Resampler`: агрегация базового ТФ в целевой по календарной сетке (open=первый, high=max, low=min, close=последний, volume=sum); выпускает **только полные группы**; неполный хвост остаётся pending (согласуется с паттерном незакрытой свечи S3j Рецепт 6).
-- Один и тот же Resampler работает в TEST (из CSV) и LIVE (из потока M5) — расхождение TEST/LIVE по построению 10m исключается конструкцией; проверяется тестом эквивалентности на общем окне.
-- Сессии MOEX (утро/вечер, аукционы, клиринг) учитываются `SessionCalendar`: бары вне сессий не фабрикуются, границы 10m-баров не пересекают разрывы сессий (поведение на стыках — фикстуры этапа D2; Q5).
+- поддерживаются `1m, 5m, 10m, 15m, 1h` (единый enum `Timeframe`);
+- `10m` не ожидается от источника и строится локально из `base_timeframe` (5m или 1m) — decisions D3;
+- ресэмплинг: только полные интервалы; неполный хвост — `pending` (`is_final=False`); пропуски не фабрикуются; ожидаемое покрытие — по календарю сессий или равномерной сетке;
+- рынок 24/7: календарь `always_on_calendar()` (окно 00:00–24:00 UTC, все дни) — рекомендованный для криптоконфигов; сессионные окна поддерживаются для бирж с техобслуживаниями (decisions D11).
 
 ### 3.4 Конфигурация (схема)
 
-Один YAML на запуск; схема валидируется pydantic-моделью; хэш конфига входит в имена всех артефактов (датасеты, модели, отчёты).
-
 ```yaml
 # configs/example.yaml  (ИЛЛЮСТРАТИВНАЯ СХЕМА, не код)
-run:
-  mode: TEST                # TEST | LIVE
-  experiment_id: sber-5m-v1
-
+run:    { mode: TEST, experiment_id: ... }        # mode: LIVE отклоняется гейтом (биржа не подключена)
 data:
   csv_dir: data/raw
   symbols:
-    - ticker: SBER
-      mic: MISX             # полный symbol = ticker@mic (требование API)
-      files:                # файлы истории по ТФ
-        "1m":  SBER_M1.csv
-        "5m":  SBER_M5.csv
-        "10m": SBER_M10.csv # опционально: иначе строится из 5m
-  timestamp_semantics: bar_open   # bar_open | bar_close — подтверждается валидатором
-  source_timezone: Europe/Moscow
-
-timeframes:                 # для КАЖДОГО ТФ свои lookback и horizon (требование ТЗ)
-  "5m":
-    enabled: true
-    lookback_bars: 240      # глубина истории для признаков (баров этого ТФ)
-    horizon_bars: 6         # горизонт прогноза (баров этого ТФ)
-    label:
-      kind: fwd_return_class    # fwd_return_class | fwd_return_reg | triple_barrier(позже)
-      neutral_band_bps: 3.0
-  "10m":
-    enabled: true
-    base_timeframe: "5m"    # 10m строится ресэмплингом из 5m
-    lookback_bars: 120
-    horizon_bars: 3
-    label: { kind: fwd_return_class, neutral_band_bps: 4.0 }
-
-features:
-  set: v1                   # версионируемый набор: returns, SMA/EMA, RSI, ATR, volume-норм., внутридневные эффекты
-  rolling_norm: expanding   # только причинные преобразования
-
-model:
-  kind: lightgbm            # lightgbm | catboost
-  params_file: configs/models/lgbm_v1.yaml
-  seed: 42
-
-validation:
-  scheme: purged_walk_forward
-  n_splits: 5
-  embargo_bars: 8           # ≥ horizon — защита от пересечения меток
-
-backtest:
-  initial_capital: 100000
-  commission_bps: 3         # ОЦЕНОЧНЫЕ параметры — реальные тарифы неизвестны (Q9)
-  slippage_bps: 2
-  fill: next_bar_open
-
-live:                       # используется только в mode: LIVE
-  account_id: ""            # демо-счёт; обязательное поле для недry-run
-  allow_orders: false       # явный флаг; true — только после этапа L3-приёмки
-  dry_run: true             # по умолчанию ВСЕГДА
-  max_order_quantity: 1
-  max_position: 1
-  max_orders_per_hour: 4
-  kill_switch_file: .kill   # наличие файла запрещает новые заявки
-  transport: grpc-sdk       # grpc-sdk (finam-sdk) | rest | ws  (интерфейс один)
+    - ticker: BTCUSDT                             # пара в формате биржи (decisions D12)
+      files: { "1m": BTCUSDT_M1.csv, "5m": BTCUSDT_M5.csv }
+  timestamp_semantics: bar_open                   # ОБЯЗАТЕЛЬНО явно
+  source_timezone: UTC                            # default UTC (D11)
+  volume_units: base_asset                        # base_asset | quote_asset (D13)
+timeframes:
+  "5m":  { enabled: true, lookback_bars: 240, horizon_bars: 6, label: {...} }
+  "10m": { enabled: true, base_timeframe: "5m", lookback_bars: ..., horizon_bars: ... }
+sessions:                                          # опционально; для крипто — 24/7 или отсутствует
+  timezone: UTC
+  days: [{ days: [0,1,2,3,4,5,6], sessions: [{ start: "00:00", end: "24:00" }] }]
+validation: {...}
+features: { set: v1, params: {...} }
+model:    { kind: lightgbm, seed: 42, params: {...} }
+evaluation: { commission_bps: ..., trading_days_per_year: 365, ... }
+risk: {...}          # все лимиты явные
+instrument: { price_step: ..., lot_size_units: ..., quote_currency: USDT }
+simulation: { commission_bps: ..., slippage_bps: ..., conflict_policy: stop_first, signal: {...} }
+live: {...}          # опционально; даже полная секция НЕ открывает LIVE (D8)
 ```
 
-Секреты (`TRADE_API_SECRET`) — только переменные окружения/.env вне git (требование S3b); в логах не появляются (S4 chego-ne-delat).
-
-> Примечание (фаза 3): фактическая реализация ML-секций конфига — `features:` (set+params),
-> `model:` (kind/seed/params), `validation.walk_forward:` и `validation.thresholds:`,
-> `evaluation:`, `run.model_dir/report_dir`; схема и значения описаны в
-> [docs/ml.md](ml.md) и `configs/ml_example.yaml`. Эскиз выше сохраняет смысл как целевая схема.
+Схема строгая (`extra="forbid"`): удалённая прежде брокерская секция и поле `mic`
+отклоняются — старые конфиги не запускаются молча (decisions D10, D12).
 
 ---
 
 ## 4. Потоки данных
 
-> Статус (фаза 4): модули `execution/` (RiskGuards, sizing, SimulatedBroker,
-> журнал), `backtest/` (EventSimulator, results) и `strategy/` (источники
-> сигналов) реализованы для TEST-режима; LIVE-шлюзы (`FinamBroker`,
-> kill-switch-файл, reconciliation с брокером) остаются этапом L3. Семантика
-> симулятора, рисковых гейтов и журнала — docs/simulation.md.
-
-> Статус (фаза 5): добавлены единая точка запуска `cli/run.py`
-> (`python -m tradebot test | live-preflight`), многофакторный LIVE-гейт
-> `live/gate.py` (отказ до любых сетевых вызовов) и ордерный адаптер
-> `finam/broker.py` (контракт `execution.interfaces.BrokerGateway`; только за
-> гейтом; проверен на подменном транспорте, НЕ проверен в брокерской среде).
-> Фактическая live-секция конфига — `allow_orders`, `kill_switch_file`,
-> `max_order_quantity_units`, `ack_env_var/ack_expected_value` (схема —
-> config/schema.py, образец — configs/live_example.yaml); поля эскиза
-> `dry_run`/`transport`/`max_orders_per_hour` не реализованы и появятся в L3.
-> LIVE-оркестратор (потоки, BarFinalizer, цикл сверки) по-прежнему не
-> реализован (roadmap L2/L3). Границы и статусы — docs/live.md.
-
 ### 4.1 TEST (обучение и симуляция)
 
 ```
-CSV → Loader/Validator → (Resampler при base_timeframe) → BarStore(parquet)
-BarStore → FeatureBuilder(lookback) → Labels(horizon) → DatasetAssembler
-DatasetAssembler → PurgedWalkForwardSplit → Train(LightGBM/CatBoost) → ModelRegistry(+манифест)
-ModelRegistry + BarStore(replay) → EventSimulator(Strategy, SimulatedBroker, издержки) → Отчёт/метрики
+CSV → load_csv(+calendar) → [resample при base_timeframe] → FeatureBuilder → DatasetAssembler(y)
+    → PurgedWalkForwardSplit → LightGBM(train/holdout) → registry(артефакт+манифест)
+    → ModelSignalSource → RiskGuards → SimulatedBroker(EventSimulator) → results/report + JSONL-журнал
 ```
 
-- Replay детерминирован: сигналы рассчитываются на закрытии бара t, исполнение — на открытии t+1 (fill=next_bar_open), издержки из конфига.
-- Датасет и сплиты версионируются хэшем конфига; «золотые» фикстуры для регрессии.
+Единая команда: `python -m tradebot test --config <yaml> --timeframe 5m --train|--model-dir <dir>`.
+Всё офлайн; `mode: LIVE` в конфиге отклоняется командой `test`.
 
-### 4.2 LIVE
+### 4.2 LIVE (НЕ реализован)
 
-```
-startup: AuthSession (SDK: авто-JWT + SubscribeJwtRenewal) → TokenDetails (account_ids, readonly, md_permissions → лог)
-         → GetAssetParams (trade_lot_size, is_tradable), Schedule, Clock  [pre-flight; при trade_lot_size=0 — стоп (S3j Рецепт 4)]
-warmup:  Bars (REST) за окно ≥ lookback+horizon → BarStore (локальный кэш закрытых свечей)
-stream:  WS/gRPC SubscribeBars(5m и/или 1m) + SubscribeQuote → BarFinalizer → Resampler(10m при выборе) → FeatureBuilder
-         (решение ТОЛЬКО по завершённым свечам; pending-бар мутирует — S3f/S3j Рецепт 6)
-signal:  Strategy(Model) → OrderIntent → RiskGuards (лимиты, расписание, kill switch, dry_run)
-execution: DryRunBroker(журнал намерений) | FinamBroker:
-           OrderIntent → валидация (шаг цены min_step/10^decimals, штуки = лоты × trade_lot_size, client_order_id ≤20, детерминированный из сигнала)
-           → PlaceOrder → журнал «неизвестного результата» → сверка GetOrders/ORDERS-поток → OrderState-машина (executed/remaining)
-state:   ORDERS/TRADES-потоки + периодический REST-снимок GetAccount → PositionManager → reconciliation (расхождения → алерт + стоп торговли)
-recovery: обрыв → backoff 1→2→4→8→16→30+jitter → re-handshake → переподписки → REST-снимки Bars/GetOrders/GetAccount → сверка → продолжение
-rate limit: клиентский лимитер ≤ 200 зап/мин на метод + GetUsageMetrics-наблюдение; 429 → пауза, не немедленный повтор
-```
+LIVE-контур заблокирован: `exchange/base.py` не содержит адаптера, гейт
+(`live/gate.py`) отказывает по условию №0 при любой конфигурации. Целевая схема
+(будущее): warmup истории через адаптер → WS-поток → BarFinalizer → те же
+Features/Strategy → RiskGuards → BrokerGateway(адаптер) с reconciliation-циклом.
+Подробности и чек-лист — [live.md](live.md), roadmap E1–E3.
 
-### 4.3 Точки интеграции с Finam Trade API (все — через интерфейсы)
+### 4.3 Точки интеграции с биржей (все — через интерфейсы)
 
-| Интерфейс | Реализация LIVE | Методы API (подтверждено S5/S8f/S8h) |
+| Потребность | Порт (реализован как контракт) | Реализация |
 |---|---|---|
-| `AuthSession` | `finam-sdk` FinamClient/AsyncFinamClient | POST /v1/sessions, /v1/sessions/details, SubscribeJwtRenewal |
-| `InstrumentsSource` | FinamInstruments | GET /v1/assets/{symbol}, /params, /schedule, /v1/assets/clock, /v1/exchanges, /v1/assets/all (кэш каталога) |
-| `HistorySource` | FinamHistory | GET /v1/instruments/{symbol}/bars (окна, кэш закрытых свечей) |
-| `StreamSource` | FinamStream (WS или gRPC — за одним интерфейсом) | BARS, QUOTES; опционально ORDER_BOOK, INSTRUMENT_TRADES |
-| `AccountSource` | FinamAccount | GET /v1/accounts/{id}, /trades, /transactions; WS ORDERS/TRADES |
-| `BrokerGateway` | FinamBroker | POST /orders (PlaceOrder), POST /sltp-orders, DELETE /orders/{id}, GET /orders, GET /orders/{id} |
-| `QuotaMonitor` | FinamMetrics | GET /v1/usage |
-
-Тесты без сети: фейковые реализации тех же интерфейсов + `for_testing()`-канал SDK к локальному фейк-серверу (S8b).
+| История свечей | `marketdata.HistorySource` | `CsvHistorySource` (TEST); биржевая — НЕТ |
+| Котировка/стакан (снимки) | `marketdata.QuoteSnapshotSource` / `OrderBookSnapshotSource` | НЕТ (будущий адаптер) |
+| Потоки | `marketdata.StreamSource` | НЕТ (будущий адаптер + BarFinalizer) |
+| Заявки/позиции/сверка | `execution.BrokerGateway` | НЕТ (только за LIVE-гейтом) |
+| Точка сборки адаптера | `exchange.ExchangeAdapter` / `get_exchange_adapter()` | всегда `ExchangeNotImplemented` |
 
 ---
 
@@ -245,81 +162,71 @@ rate limit: клиентский лимитер ≤ 200 зап/мин на ме�
 
 ### 5.1 Выбор модели
 
-- **Основной кандидат: LightGBM** (градиентный бустинг над таблицей): быстрые итерации, нативная работа с числовыми признаками свечей, importance/SHAP для аудита, устойчивость к масштабу.
-- **Второй кандидат: CatBoost** (ordered boosting — меньше риск оптимистичного смещения на временных рядах при корректных сплитах; удобен, если появятся категориальные признаки — сессия/день недели уже есть как ordinal).
-- Сравнение — строго на purged walk-forward, по заранее зафиксированным метрикам (см. 5.3). Победитель фиксируется в decisions.md после этапа M2.
-- **Transformer/LSTM — не на первом этапе.** Обоснование допуска в будущем: только если (а) табличная модель упрётся в подтверждённый потолок, (б) последовательностная архитектура даст воспроизводимое улучшение на walk-forward с учётом издержек и (в) появится бюджет на инфраструктуру/обслуживание. Сейчас ни одно условие не подтверждено — см. decisions.md D5. Никаких моделей по изображениям графиков (подход WISEPLAT) — исключено ТЗ.
+LightGBM (основной) + логистическая регрессия и «предыдущий знак» как sanity-базейны;
+CatBoost — контрольный кандидат (P1). Transformer/LSTM отложены до выполнения явных
+условий: подтверждённый потолок табличной модели + воспроизводимое улучшение на
+walk-forward + бюджет на инфраструктуру (decisions D4).
 
 ### 5.2 Целевая переменная (базовый вариант)
 
-Для бара t таймфрейма TF с горизонтом H = `horizon_bars`:
-
-- Основная: `fwd_return(t) = close[t+H] / close[t] − 1` — рассчитывается по **закрытым** свечам того же ТФ.
-- Базовая задача: **классификация направления с нейтральной полосой** (учитывает издержки):
-  - `y = 1`, если `fwd_return > +band`; `y = 0`, если `< −band`; класс `neutral` (или исключение из обучения) в полосе `±band`, где band ≈ комиссия+слиппедж из конфига (neutral_band_bps).
-- Альтернативы, оцениваемые на этапе M1 как ablation: регрессия `fwd_return`; тройной барьер (TP/SL/времени) — откладывается до работающего базового контура (усложняет разметку и симулятор).
-- Важно: WISEPLAT-подобная схема «метка = закрытие старшего ТФ выше предыдущего» учтена как частный случай (H баров младшего ТФ ≈ 1 бар старшего); отдельный «старший ТФ» в контракте не требуется — горизонт задаётся в барах своего ТФ (конфиг per-timeframe, требование ТЗ).
+forward-return через `horizon_bars` с нейтральной полосой `neutral_band_bps`
+(классификация up/down/neutral-excluded); регрессия — альтернатива в конфиге;
+triple-barrier не реализован (P2). Подробности — [ml.md](ml.md).
 
 ### 5.3 Метрики оценки (фиксируются ДО обучения)
 
-- ML: ROC-AUC / log-loss (классификация), MAE/R² (регрессия) — по каждому walk-forward-фолду и агрегированно.
-- Торговые (бэктест, с издержками): число сделок, hit-rate, profit factor, max drawdown, распределение PnL — **как диагностические метрики симуляции**. Никаких обещаний доходности; результаты на истории не гарантируют будущее. Система не объявляется production-ready.
-- Порог «модель проходит дальше» — заранее записанный в конфиг валидации (например, AUC OOS > 0.52 стабильно по фолдам + неотрицательный PnL после издержек в симуляции); иначе этап не принимается.
+классификация: ROC-AUC, log-loss, accuracy, баланс классов; регрессия: MAE/R².
+Плюс «торговые» метрики оценочной симуляции (net_return, maxDD, Sharpe/CAGR с
+явным годовым пересчётом: крипторынок — `trading_days_per_year: 365`).
 
 ### 5.4 Признаки (набор v1, табличный)
 
-Для окна `lookback_bars` на закрытии бара t (все — причинные, только ≤ t):
-- лагированные доходности (1..k баров), log-return;
-- скользящие (SMA/EMA нескольких периодов) и отношения close/SMA;
-- волатильность: rolling std, ATR, range-статистики;
-- объёмные: volume/rolling_mean(volume), дельты объёма;
-- позиционные: (close−low)/(high−low), gap к предыдущему open;
-- внутридневные: минута дня/сессия (ordinal), близость к границам сессии;
-- опционально (после проверки Q4): агрегаты стакана/спреда из QUOTES — только если эмпирически подтверждены на демо.
-
-Версионирование: набор признаков — `features.set: v1/v2/...`, манифест колонок сохраняется вместе с моделью; рассинхрон «модель ↔ признаки» недопустим (проверяется загрузчик модели).
+31 причинный признак: лаги доходностей, EMA/RSI/MACD/ATR, волатильность, объёмные
+(в т.ч. для дробного объёма), позиционные внутри диапазона, временные (в локальной
+таймзоне конфига, по умолчанию UTC). Warmup — явный (61 бар по умолчанию);
+манифест колонок сохраняется с моделью. Подробности — [ml.md](ml.md) §2.
 
 ---
 
 ## 6. План защиты от утечки данных (leakage)
 
-1. **Причинность признаков**: FeatureBuilder видит только бары с `ts_open + tf ≤ decision_time`. Property-based тест: возмущение любых будущих баров не меняет вектор признаков в t (hypothesis-тест, этап F2).
-2. **Метки только в обучении**: y(t) использует close[t+H] — строится исключительно в DatasetAssembler; в inference-пути кода меток нет физически (раздельные модули, линтер-правило на импорт `labels` из `strategy/live`).
-3. **Purged Walk-Forward + embargo**: фолды идут строго по времени; между train и test удаляется зазор ≥ `horizon_bars` (embargo), чтобы перекрывающиеся метки не протекали. Никакого случайного KFold.
-4. **Никаких глобальных фитов**: нормализация/скейлинг — только expanding/rolling статистики, фитованные на прошлом фолда; стандартизация на всём датасете запрещена (проверяется тестом).
-5. **Временные метки**: нормализация bar_open/bar_close и таймзон — до сборки датасета (ошибка сдвига на 1 бар = системная утечка); валидатор D1 + фикстуры на стыках сессий.
-6. **Индексация «решение ↔ исполнение»**: сигнал на закрытии t → исполнение не раньше открытия t+1 в симуляторе; в LIVE решение отправляется после финализации бара (BarFinalizer), а не по pending-бару.
-7. **Версионирование артефактов**: датасет/сплиты/модель/отчёт связаны хэшем конфига и версии кода; повторный прогон воспроизводим (seed фиксируется).
-8. **Аудит-отчёт утечек** (часть этапа M1): сравнение «наивного» random-split и walk-forward — большая разница трактуется как признак утечки/нестационарности и блокирует промоушен модели.
-9. **Дубли свечей**: в LIVE поток может повторно присылать тот же timestamp (S4) — BarFinalizer дедуплицирует по (symbol, tf, ts_open); иначе признаки «увидят будущее» собственного финального значения.
+1. **Причинность признаков**: FeatureBuilder видит только бары до момента решения; property-тест: возмущение будущих баров не меняет вектор признаков в t.
+2. **Метки только в обучении**: y(t) использует close[t+H] — строится исключительно в DatasetAssembler; в inference-пути меток нет физически.
+3. **Purged Walk-Forward + embargo**: фолды строго по времени; зазор ≥ `horizon_bars`; никакого случайного KFold.
+4. **Никаких глобальных фитов**: нормализация — только статистики train-окна.
+5. **Временные метки**: нормализация bar_open/bar_close и таймзон (UTC) — до сборки датасета; ошибка сдвига на 1 бар = системная утечка; фикстуры на переходе через полночь (серия 24/7).
+6. **Индексация «решение ↔ исполнение»**: сигнал на закрытии t → исполнение не раньше открытия t+1; в будущем LIVE — только по финализированному бару (BarFinalizer).
+7. **Версионирование артефактов**: датасет/сплиты/модель/отчёт связаны хэшем конфига и версиями библиотек; seed фиксируется.
+8. **Аудит-отчёт утечек**: сравнение «наивного» random-split и walk-forward — большая разница трактуется как признак утечки/нестационарности и блокирует промоушен модели.
+9. **Дубли свечей**: будущий поток биржи может повторно присылать тот же timestamp — BarFinalizer обязан дедуплицировать по (symbol, tf, ts_open).
 
 ---
 
-## 7. Обработка ошибок, надёжность, безопасность (LIVE)
+## 7. Обработка ошибок, надёжность, безопасность
 
-- Retry-политика — по официальной таблице (research.md §2.8): GET — backoff+jitter; 429 — пауза и снижение частоты; PlaceOrder без ответа — NEVER blind retry, только сверка по `client_order_id` + GetOrders; CancelOrder без ответа — GetOrder. SDK уже ретраит UNAVAILABLE и server-approved rate-limit pushback; стримы переподключает приложение.
-- Reconciliation: при старте, после каждого обрыва и периодически — снимки GetAccount/GetOrders vs локальный журнал; расхождение → алерт + приостановка новых заявок.
-- RiskGuards (обязательный слой перед BrokerGateway): dry_run по умолчанию; allowlist account_id (демо); лимиты количества/позиции/частоты; проверка расписания (Schedule) и is_tradable; запрет новой команды при неизвестном результате предыдущей; kill switch; всё из Рецепта 7 (S3j) и примера SMA (S8i: «ровно один счёт у токена, иначе не торговать»).
-- Журналирование: структурированные логи (auth-результат и expires_at без токена, подписки, REST-статусы и длительности, заявки client_order_id/order_id/status, сделки, сверки) — состав полей по S3j Рецепт 8; секреты не логируются никогда.
-- Деньги/цены: Decimal/целые тики в контуре заявок; проверка кратности шагу `min_step/10^decimals`; лоты→штуки через `trade_lot_size` (0 = стоп операции).
+- **TEST**: ошибки данных/конфига/модели — явные коды возврата CLI (2/3/4) и читаемые сообщения; ничего не чинится молча; предупреждения валидации попадают в отчёт.
+- **LIVE (принципы для будущего адаптера)**: retry — только для идемпотентных чтений; потерянный ответ на заявку — NEVER blind retry, только сверка по детерминированному `client_order_id` (контракт `BrokerGateway.resolve_unknown`); reconciliation позиций при старте/обрывах/периодически; kill-switch-файл запрещает новые заявки; RiskGuards — обязательный слой перед шлюзом.
+- **Секреты**: инфраструктура `config/env.py` (только окружение/.env вне git, маскирование в логах и журнале). Сейчас секретов не требуется — сеть отсутствует.
+- **Деньги/цены**: в контуре заявок (будущем) — Decimal/шаги цены; проверка кратности `price_step`; количества — D14 (целые, дробные отложены).
 
 ---
 
-## 8. Технологический стек (предложение)
+## 8. Технологический стек
 
-- Python **3.11** (SDK требует ≥3.10; 3.11 — стабильная совместимость с lightgbm/catboost).
-- Ядро: `pandas`, `numpy`, `pyarrow` (parquet), `pydantic` (конфиг/контракты), `PyYAML`.
-- ML: `lightgbm` (основной), `catboost` (опциональный extra), `scikit-learn` (метрики/сплиты-утилиты), `shap` (аудит, опционально).
-- LIVE extra: `finam-sdk==2.23.0` (pin; changelog читать перед обновлением — S3k), `websockets` (если выбирается WS-транспорт вместо gRPC).
-- Качество: `pytest`, `hypothesis` (property-тесты причинности), `ruff`, `mypy`, pre-commit; CI — линт+тесты на каждый этап.
-- Хранилище: файловая система (parquet + JSON-манифесты); БД не требуется на этом масштабе.
+- Python **≥3.10** (разработка/проверки — 3.11).
+- Ядро: `pydantic` (строгий конфиг), `PyYAML`, `tzdata` (Windows: IANA-таймзоны через zoneinfo; внутренний стандарт — UTC).
+- ML extra: `numpy`, `pandas`, `lightgbm>=4,<5` (pin — decisions D4), `scikit-learn` (метрики/базейн), `pyarrow` (датасеты).
+- Сетевых/биржевых зависимостей НЕТ: подключение биржи не реализовано; его зависимости добавляются отдельным решением (roadmap E2).
+- Качество: `pytest` (dev extra), офлайн-сценарии `scripts/manual_checks/`.
+- Хранилище: файловая система (CSV + parquet/JSON-артефакты); БД не требуется.
 
 ---
 
 ## 9. Что сознательно НЕ входит в текущую архитектуру
 
-- Реальная торговля на боевом счёте (решение не принимается; контур закрыт dry-run/демо).
-- Модели по изображениям графиков (запрет ТЗ).
-- Портфельная торговля несколькими инструментами одновременно (v1 — один символ на конфигурацию; мульти-символ — расширение PositionManager позже).
-- Стакан как обязательный источник признаков (Q4 не закрыт — только опциональный адаптер).
-- Собственная реализация gRPC-транспорта (используем официальный SDK; «самописный транспорт» прямо не рекомендован S8i).
+- Реальная торговля: LIVE заблокирован (D8), реальные ордера — вне проекта до отдельных решений (P9).
+- Подключение к какой-либо конкретной криптобирже, API-клиенты, аутентификация, потоки — не реализованы (roadmap E1–E3).
+- Тип рынка (спот/маржа/фьючерсы), плечо, funding, шорты, ликвидации — НЕ предполагаются (D15); симулятор long-only без маржи.
+- Модели по изображениям графиков.
+- Мульти-символьный портфель (v1 — одна пара на конфигурацию; P5).
+- Стакан как источник признаков (P3, после потокового адаптера).

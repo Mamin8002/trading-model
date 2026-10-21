@@ -4,15 +4,19 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tradebot"
-version = "0.1.0"
-description = "MOEX trading bot skeleton: config, CSV data layer, resampling, read-only Finam Trade API adapter (Phase 0-2)"
+version = "0.2.0"
+description = "Crypto trading bot skeleton: config, local OHLCV CSV data layer (UTC, 24/7), resampling, ML (LightGBM), risk controls, TEST simulator. Exchange connectivity is NOT implemented; LIVE is blocked."
 readme = "README.md"
 requires-python = ">=3.10"
 # Обоснование зависимостей (docs/architecture.md §8, docs/decisions.md D10):
 # - pydantic: строгая схема конфигурации (валидация до запуска);
 # - PyYAML: декларативные YAML-конфиги;
-# - tzdata: IANA-таймзоны (Europe/Moscow) через zoneinfo на Windows (у пользователя PowerShell).
-# Extra "ml" (фаза 3, docs/ml.md): numpy/pandas — расчёт признаков и датасет;
+# - tzdata: IANA-таймзоны через zoneinfo на Windows (у пользователя PowerShell);
+#   метки времени проекта — UTC (docs/data.md §2), именованные зоны нужны только
+#   если пользователь явно задаст source_timezone/sessions.timezone.
+# Сетевых/биржевых зависимостей НЕТ: подключение к криптобирже не реализовано
+# (exchange/base.py); при его реализации зависимости добавляются отдельным решением.
+# Extra "ml" (docs/ml.md): numpy/pandas — расчёт признаков и датасет;
 # lightgbm — основной кандидат моделей (decisions D4); pin <5: в 4.7 помечен
 # deprecated eval_set API, до 5.x не переходим без отдельной проверки;
 # scikit-learn — метрики и логистический базовый ориентир (D4);

@@ -152,11 +152,10 @@ class TestRepoHygiene:
             yield from Path(".").glob(pattern)
 
     def test_no_order_endpoints_in_code(self):
-        # Торговые операции разрешены ТОЛЬКО в отдельном ордерном адаптере
-        # src/tradebot/finam/broker.py (фаза 5, за многофакторным LIVE-гейтом,
-        # docs/live.md) и в его тестах — эти файлы в явном allowlist.
-        # Все остальные модули (data/ml/backtest/strategy/execution/cli/live) —
-        # по-прежнему «без торговли»: появление торговых вызовов там блокируется.
+        # Торговые операции (ордерные эндпоинты) в проекте ОТСУТСТВУЮТ целиком:
+        # подключение к криптобирже не реализовано (exchange/base.py), прежний
+        # брокерский адаптер удалён. Появление торговых вызовов в любом модуле
+        # блокируется этим тестом — до отдельной осознанной реализации адаптера.
         forbidden = [
             "/or" + "ders",
             "Place" + "Order",
@@ -164,14 +163,7 @@ class TestRepoHygiene:
             "sltp-" + "orders",
             "new_" + "order",
         ]
-        allowed_files = {
-            "test_env_cli.py",
-            "broker.py",
-            "test_broker_adapter.py",
-            "test_live_gate.py",
-            "test_integration_pipeline.py",
-            "check_phase_05_test_run.py",
-        }
+        allowed_files: set[str] = set()  # разрешённых файлов больше нет
         offenders = []
         for path in self._iter_repo_files():
             if path.name in allowed_files:
@@ -180,7 +172,19 @@ class TestRepoHygiene:
             for token in forbidden:
                 if token in text:
                     offenders.append(f"{path}: {token}")
-        assert offenders == [], f"Найдены упоминания торговых операций вне allowlist: {offenders}"
+        assert offenders == [], f"Найдены упоминания торговых операций: {offenders}"
+
+    def test_no_legacy_broker_references(self):
+        # прежняя брокерская интеграция удалена из кода и конфигов;
+        # токены собраны из фрагментов, чтобы проверка не обнаруживала саму себя
+        forbidden = ["fi" + "nam", "MO" + "EX", "MI" + "SX", "api.fi" + "nam.ru"]
+        offenders = []
+        for path in self._iter_repo_files():
+            text = path.read_text(encoding="utf-8", errors="replace")
+            for token in forbidden:
+                if token.lower() in text.lower():
+                    offenders.append(f"{path}: {token}")
+        assert offenders == [], f"Найдены упоминания удалённой интеграции: {offenders}"
 
     def test_env_example_has_only_placeholders(self):
         text = Path(".env.example").read_text(encoding="utf-8")
@@ -194,9 +198,9 @@ class TestRepoHygiene:
         assert "!.env.example" in text
 
     def test_real_env_secret_not_in_sources(self):
-        real = os.environ.get("TRADE_API_SECRET", "").strip()
+        real = os.environ.get("EXCHANGE_API_SECRET", "").strip()
         if not real:
-            pytest.skip("TRADE_API_SECRET не задан в окружении — проверять нечего")
+            pytest.skip("EXCHANGE_API_SECRET не задан в окружении — проверять нечего")
         for path in self._iter_repo_files():
             assert real not in path.read_text(encoding="utf-8", errors="replace"), path
 

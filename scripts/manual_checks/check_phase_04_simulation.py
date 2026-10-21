@@ -7,7 +7,7 @@
 Сценарий ПОЛНОСТЬЮ ЛОКАЛЬНЫЙ и ДЕТЕРМИНИРОВАННЫЙ:
 - входные данные — «ручные» серии баров с заранее известными ожидаемыми значениями
   (все числа в проверках посчитаны вручную и напечатаны как «ожидалось»);
-- Finam API не используется, секреты не требуются;
+- сеть не используется, секреты не требуются;
 - РЕАЛЬНЫЕ ЗАЯВКИ НЕ ОТПРАВЛЯЮТСЯ: работает TEST-симулятор (docs/simulation.md),
   подтверждения брокера не имитируются;
 - артефакты (журнал, отчёт) создаются в reports/phase04_manual/ (каталог
@@ -78,18 +78,18 @@ def expect(condition: bool, message: str) -> None:
 def make_bars(ohlc: list[tuple[float, float, float, float]], start: datetime = START) -> list[Bar]:
     return [
         Bar(ts_open=start + timedelta(minutes=i), open=o, high=h, low=l, close=c,
-            volume=1000 + i, source=BarSource.CSV, symbol="TEST@TEST")
+            volume=1000 + i, source=BarSource.CSV, symbol="TEST-USDT")
         for i, (o, h, l, c) in enumerate(ohlc)
     ]
 
 
 def buy_at(bar: Bar, stop=None, target=None) -> Signal:
-    return Signal(ts_open=bar.ts_open, side=Side.BUY, symbol="TEST@TEST", timeframe="1m",
+    return Signal(ts_open=bar.ts_open, side=Side.BUY, symbol="TEST-USDT", timeframe="1m",
                   model_version="scripted-demo", proba=0.9, stop_price=stop, target_price=target)
 
 
 def exit_at(bar: Bar) -> Signal:
-    return Signal(ts_open=bar.ts_open, side=None, symbol="TEST@TEST", timeframe="1m",
+    return Signal(ts_open=bar.ts_open, side=None, symbol="TEST-USDT", timeframe="1m",
                   model_version="scripted-demo", proba=0.1, meta={"kind": "exit"})
 
 
@@ -97,9 +97,9 @@ BASE_CFG: dict[str, Any] = {
     "run": {"mode": "TEST", "experiment_id": "phase04-manual", "model_dir": "models", "report_dir": "reports"},
     "data": {
         "csv_dir": "data/raw",
-        "symbols": [{"ticker": "TEST", "mic": "TEST", "files": {}}],
+        "symbols": [{"ticker": "TEST-USDT", "files": {}}],
         "timestamp_semantics": "bar_open",
-        "source_timezone": "Europe/Moscow",
+        "source_timezone": "UTC",
     },
     "timeframes": {"1m": {"enabled": True, "lookback_bars": 10, "horizon_bars": 1}},
     "risk": {
@@ -134,14 +134,14 @@ def build_config(**overrides) -> AppConfig:
 
 
 def simulate(cfg, bars, signals, journal_path: Path | None = None, bar_hook=None):
-    source = ScriptedSignalSource(signals, symbol="TEST@TEST", timeframe="1m")
+    source = ScriptedSignalSource(signals, symbol="TEST-USDT", timeframe="1m")
     if journal_path is None:
-        return run_simulation(cfg, bars, source, timeframe="1m", symbol="TEST@TEST",
+        return run_simulation(cfg, bars, source, timeframe="1m", symbol="TEST-USDT",
                               bar_hook=bar_hook), None
     journal_path.parent.mkdir(parents=True, exist_ok=True)
-    with JournalWriter(journal_path, symbol="TEST@TEST", timeframe="1m",
+    with JournalWriter(journal_path, symbol="TEST-USDT", timeframe="1m",
                        model_version="scripted-demo") as journal:
-        run = run_simulation(cfg, bars, source, timeframe="1m", symbol="TEST@TEST",
+        run = run_simulation(cfg, bars, source, timeframe="1m", symbol="TEST-USDT",
                              journal=journal, bar_hook=bar_hook)
     return run, journal_path
 
@@ -473,12 +473,12 @@ def check_stale_invalid_desync() -> str:
         RiskConfig(initial_capital_quote=100_000.0, position_units=10, max_position_units=100,
                    max_orders_per_day=10, daily_loss_limit_quote=1_000.0, max_drawdown_pct=10.0,
                    max_data_age_seconds=60.0),
-        None, SimulationConfig(commission_bps=0.0, slippage_bps=0.0), local_timezone="Europe/Moscow",
+        None, SimulationConfig(commission_bps=0.0, slippage_bps=0.0), local_timezone="UTC",
     )
     from tradebot.execution.interfaces import OrderIntent, PortfolioState
-    intent = OrderIntent(created_at=ts, symbol="TEST@TEST", timeframe="1m", side=Side.BUY,
+    intent = OrderIntent(created_at=ts, symbol="TEST-USDT", timeframe="1m", side=Side.BUY,
                          quantity_units=10,
-                         signal=Signal(ts_open=ts, side=Side.BUY, symbol="TEST@TEST", timeframe="1m",
+                         signal=Signal(ts_open=ts, side=Side.BUY, symbol="TEST-USDT", timeframe="1m",
                                        model_version="t"),
                          reference_price=100.0)
     context = RiskContext(decision_ts=ts, last_bar_ts_open=ts, last_close=100.0, equity=100_000.0,
@@ -490,7 +490,7 @@ def check_stale_invalid_desync() -> str:
 
     bars = make_bars([(100.0, 100.5, 99.5, 100.0)] * 8)
     bars[5] = Bar(ts_open=bars[5].ts_open, open=100.0, high=98.0, low=99.0, close=100.0,
-                  volume=10, symbol="TEST@TEST")  # high < low
+                  volume=10, symbol="TEST-USDT")  # high < low
     run, _ = simulate(build_config(), bars, [buy_at(bars[0])])
     expect(run.completed is False and any(h.reason == "invalid_data" for h in run.halts),
            f"invalid bar: {run.halts}")
@@ -540,7 +540,7 @@ def check_journal_audit() -> str:
     secret_path = OUT_DIR / "journal_masking_demo.jsonl"
     if secret_path.exists():
         secret_path.unlink()
-    with JournalWriter(secret_path, symbol="TEST@TEST", timeframe="1m",
+    with JournalWriter(secret_path, symbol="TEST-USDT", timeframe="1m",
                        model_version="scripted-demo", masker=masker) as writer:
         writer.record("warning", message="утечка FAKE-SECRET-PHASE4-000 в тексте")
     text = secret_path.read_text(encoding="utf-8")
@@ -575,7 +575,7 @@ def check_report() -> str:
 
 
 @check("CLI simulate доступен офлайн (--help), реальные заявки не реализованы",
-       "python -m tradebot.cli.simulate --help -> exit 0; в коде execution/backtest нет торговых эндпоинтов Finam")
+       "python -m tradebot.cli.simulate --help -> exit 0; в коде execution/backtest нет торговых эндпоинтов")
 def check_cli_and_no_real_orders() -> str:
     proc = subprocess.run([sys.executable, "-m", "tradebot.cli.simulate", "--help"],
                           capture_output=True, text=True, timeout=120, cwd=str(REPO_ROOT))

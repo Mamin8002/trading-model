@@ -124,7 +124,7 @@ class ModelBundle:
         if mismatches:
             raise ModelCompatibilityError(mismatches)
 
-    def predict_proba(self, bars: Sequence[Bar], *, local_timezone: str = "Europe/Moscow") -> np.ndarray:
+    def predict_proba(self, bars: Sequence[Bar], *, local_timezone: str = "UTC") -> np.ndarray:
         """Прогноз P(y=1) (бинарная цель) или значения (регрессия) по барам.
 
         Признаки строятся тем же FeatureBuilder по манифесту модели; список и

@@ -28,7 +28,7 @@ class TestLoading:
     def test_example_config_valid(self):
         config = load_config(BASE)
         assert config.run.mode == "TEST"
-        assert config.data.symbols[0].symbol == "SBER@MISX"
+        assert config.data.symbols[0].symbol == "BTCUSDT"
         assert config.data.timestamp_semantics == "bar_open"
         tf5 = config.timeframes["5m"]
         assert tf5.lookback_bars == 240 and tf5.horizon_bars == 6
@@ -36,6 +36,7 @@ class TestLoading:
     def test_demo_config_valid(self):
         config = load_config(DEMO)
         assert config.data.csv_dir == Path("data/demo")
+        assert config.data.source_timezone == "UTC"
         assert "10m" in config.timeframes
         assert config.timeframes["10m"].base_timeframe == "5m"
 
@@ -113,15 +114,18 @@ class TestStrictness:
         with pytest.raises(ConfigError):
             load_config(write_cfg(tmp_path, raw))
 
-    def test_http_base_url_rejected(self, tmp_path):
+    def test_legacy_broker_section_rejected(self, tmp_path):
+        # прежняя брокерская секция удалена из схемы: extra="forbid" отклоняет её
+        # (имя секции собрано из фрагментов — гигиена-тесты сканируют tests/*.py)
         raw = load_raw()
-        raw["finam"]["base_url"] = "http://api.finam.ru"
-        with pytest.raises(ConfigError, match="https"):
+        raw["fi" + "nam"] = {"base_url": "https://example.invalid"}
+        with pytest.raises(ConfigError):
             load_config(write_cfg(tmp_path, raw))
 
-    def test_rate_limit_above_documented_rejected(self, tmp_path):
+    def test_symbol_mic_field_rejected(self, tmp_path):
+        # формат ticker@mic удалён: символ криптопары задаётся одним тикером
         raw = load_raw()
-        raw["finam"]["rate_limit_per_minute"] = 500  # документированный лимит 200/мин
+        raw["data"]["symbols"][0]["mic"] = "XXXX"
         with pytest.raises(ConfigError):
             load_config(write_cfg(tmp_path, raw))
 
@@ -131,13 +135,40 @@ class TestStrictness:
         with pytest.raises(ConfigError):
             load_config(write_cfg(tmp_path, raw))
 
+    def test_session_window_24_00_allowed(self, tmp_path):
+        # рынок 24/7: конец окна "24:00" допустим (docs/data.md §3)
+        raw = load_raw()
+        raw["sessions"] = {"timezone": "UTC",
+                           "days": [{"days": [0, 1, 2, 3, 4, 5, 6],
+                                     "sessions": [{"start": "00:00", "end": "24:00"}]}]}
+        config = load_config(write_cfg(tmp_path, raw))
+        assert config.sessions is not None
+
+    def test_bad_session_end_rejected(self, tmp_path):
+        raw = load_raw()
+        raw["sessions"] = {"timezone": "UTC",
+                           "days": [{"days": [0], "sessions": [{"start": "00:00", "end": "25:00"}]}]}
+        with pytest.raises(ConfigError):
+            load_config(write_cfg(tmp_path, raw))
+
+    def test_volume_units_literal(self, tmp_path):
+        raw = load_raw()
+        raw["data"]["volume_units"] = "base_asset"
+        assert load_config(write_cfg(tmp_path, raw)).data.volume_units == "base_asset"
+        raw["data"]["volume_units"] = "pieces"  # прежнее значение удалено из схемы
+        with pytest.raises(ConfigError):
+            load_config(write_cfg(tmp_path, raw))
+
 
 class TestCalendarBuild:
     def test_calendar_built_from_config(self):
         config = load_config(DEMO)
         calendar = build_calendar(config)
         assert calendar is not None
-        assert calendar.timezone.key == "Europe/Moscow"
+        # крипто-демо: круглосуточный календарь 24/7 в UTC
+        assert calendar.timezone.key == "UTC"
+        from datetime import datetime, timezone as tz
+        assert calendar.is_trading_time(datetime(2024, 1, 6, 23, 30, tzinfo=tz.utc))  # суббота
 
     def test_calendar_none_when_sessions_absent(self, tmp_path):
         raw = load_raw()

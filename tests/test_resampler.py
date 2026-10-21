@@ -18,7 +18,7 @@ from tradebot.data.sessions import SessionCalendar
 from conftest import make_bar
 
 UTC = timezone.utc
-START = datetime(2024, 1, 4, 7, 0, tzinfo=UTC)  # 10:00 MSK
+START = datetime(2024, 1, 4, 7, 0, tzinfo=UTC)
 
 
 def known_series(count: int, skip: set[int] | None = None):
@@ -113,8 +113,8 @@ class TestAggregationKnownValues:
 
     def test_symbol_propagation(self):
         bars = known_series(10)
-        result = resample(bars, "1m", "5m", symbol="SBER@MISX")
-        assert all(b.symbol == "SBER@MISX" for b in result.bars)
+        result = resample(bars, "1m", "5m", symbol="BTCUSDT")
+        assert all(b.symbol == "BTCUSDT" for b in result.bars)
 
 
 class TestIncompleteHandling:
@@ -207,10 +207,10 @@ class TestValidation:
 
 class TestSessionCalendar:
     def test_break_interval_complete_with_calendar(self):
-        # сессии 10:00-10:05 и 10:10-10:15 MSK; бары только в окнах
+        # сессии 07:00-07:05 и 07:10-07:15 UTC; бары только в окнах
         calendar = SessionCalendar.from_spec(
-            "Europe/Moscow",
-            [(range(0, 7), [("10:00", "10:05"), ("10:10", "10:15")])],
+            "UTC",
+            [(range(0, 7), [("07:00", "07:05"), ("07:10", "07:15")])],
         )
         bars = []
         for minute in list(range(0, 5)) + list(range(10, 15)):
@@ -237,8 +237,8 @@ class TestSessionCalendar:
 
     def test_non_trading_interval_not_fabricated(self):
         calendar = SessionCalendar.from_spec(
-            "Europe/Moscow",
-            [(range(0, 7), [("10:00", "10:05")])],
+            "UTC",
+            [(range(0, 7), [("07:00", "07:05")])],
         )
         bars = known_series(5)  # только 10:00..10:04
         # продлим данными до 10:20, но вне сессии баров нет

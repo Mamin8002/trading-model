@@ -37,7 +37,7 @@ __all__ = ["FeatureBuilder"]
 
 
 class FeatureBuilder:
-    def __init__(self, spec: FeatureSpec, local_timezone: str = "Europe/Moscow") -> None:
+    def __init__(self, spec: FeatureSpec, local_timezone: str = "UTC") -> None:
         if spec.version != "v1":
             raise ValueError(f"FeatureBuilder: неизвестная версия набора признаков {spec.version!r}")
         self.spec = spec
@@ -48,7 +48,7 @@ class FeatureBuilder:
         return self.spec.feature_names
 
     @classmethod
-    def from_config(cls, features_cfg, local_timezone: str = "Europe/Moscow") -> "FeatureBuilder":
+    def from_config(cls, features_cfg, local_timezone: str = "UTC") -> "FeatureBuilder":
         return cls(FeatureSpec.from_config(features_cfg), local_timezone=local_timezone)
 
     def build(self, bars: Sequence[Bar]) -> pd.DataFrame:

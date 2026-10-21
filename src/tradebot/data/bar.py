@@ -1,12 +1,15 @@
 """Контракт данных: Bar, Timeframe, BarSource (docs/architecture.md §3.2, §3.3).
 
-Внутреннее представление свечи:
+Внутреннее представление свечи (криптовалютный режим, docs/data.md):
 - ``ts_open`` — всегда timezone-aware, UTC, семантика "начало бара" (bar_open).
   Нормализация из bar_close и из локальных таймзон выполняется на границе загрузки
-  (CSV-loader / Finam-адаптер), а не внутри ядра.
+  (CSV-loader / будущий адаптер биржи), а не внутри ядра. Крипторынок работает
+  круглосуточно: внутренняя единая зона UTC устраняет двусмысленность меток.
 - цены — float (для ML-контура); в контуре заявок — только Decimal/строки
-  (docs/decisions.md D1; конверсия выполняется в execution/, которого ещё нет).
-- ``volume`` — целое число штук.
+  (docs/decisions.md D1; конверсия выполняется на границе биржевого адаптера,
+  который ещё не реализован — см. exchange/base.py).
+- ``volume`` — неотрицательное число (float): объём криптопар обычно дробный
+  (единицы базового актива, например 0.123 BTC — docs/decisions.md D13).
 """
 
 from __future__ import annotations
@@ -72,21 +75,23 @@ _TIMEFRAME_MINUTES = {"1m": 1, "5m": 5, "10m": 10, "15m": 15, "1h": 60}
 class BarSource(str, Enum):
     """Источник бара.
 
-    ``derived`` — бар, построенный локальным ресэмплингом (например 10m из 5m/1m),
-    а не полученный из внешнего источника напрямую. Расширение enum из
-    architecture §3.2 зафиксировано в docs/data.md.
+    ``CSV`` — локальный файл (основной источник в крипторежиме);
+    ``EXCHANGE_REST``/``EXCHANGE_WS`` — зарезервированы для будущего биржевого
+    адаптера (НЕ реализован — exchange/base.py, docs/live.md);
+    ``DERIVED`` — бар, построенный локальным ресэмплингом (например 10m из 5m/1m),
+    а не полученный из внешнего источника напрямую (docs/data.md).
     """
 
     CSV = "csv"
-    FINAM_REST = "finam_rest"
-    FINAM_WS = "finam_ws"
+    EXCHANGE_REST = "exchange_rest"
+    EXCHANGE_WS = "exchange_ws"
     DERIVED = "derived"
 
 
 def floor_to_grid(ts: datetime, step_minutes: int) -> datetime:
     """Округление метки времени вниз до сетки шага (в UTC).
 
-    Корректно для любого целочасового смещения локальной зоны (Europe/Moscow = UTC+3):
+    Корректно для любого целочасового смещения локальной зоны (например UTC+9):
     часовые/15/10/5-минутные границы совпадают в UTC и локальном времени.
     """
     if ts.tzinfo is None:
@@ -108,7 +113,7 @@ class Bar:
     high: float
     low: float
     close: float
-    volume: int
+    volume: float
     source: BarSource = BarSource.CSV
     is_final: bool = True
     symbol: str = ""
@@ -130,8 +135,10 @@ class Bar:
                 raise TypeError(f"Поле {name!r} должно быть числом, получено {type(value).__name__}")
             if not math.isfinite(value):
                 raise ValueError(f"Поле {name!r} не конечно: {value!r}")
-        if not isinstance(self.volume, int) or isinstance(self.volume, bool):
-            raise TypeError(f"volume должен быть int (штуки), получено {type(self.volume).__name__}")
+        if isinstance(self.volume, bool) or not isinstance(self.volume, (int, float)):
+            raise TypeError(f"volume должен быть числом (int/float), получено {type(self.volume).__name__}")
+        if not math.isfinite(self.volume):
+            raise ValueError(f"volume не конечен: {self.volume!r}")
         if self.volume < 0:
             raise ValueError(f"volume не может быть отрицательным: {self.volume}")
 

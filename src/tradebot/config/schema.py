@@ -6,12 +6,11 @@
 - ``lookback_bars`` и ``horizon_bars`` для каждого включённого таймфрейма —
   ОБЯЗАТЕЛЬНЫЕ поля без значений по умолчанию (требование ТЗ: значения явные,
   ничего не подбирается молча при запуске);
-- секреты (secret_key, account_id) в конфиге запрещены — только имена
-  env-переменных, значения читаются из окружения (docs/research.md S3b, S4);
-- эта фаза (0-2) покрывает: run/data/timeframes/sessions/validation/finam.
-  Поля features/model/backtest/live из architecture §3.4 появятся на своих этапах
-  (roadmap F1/M2/B1/L3) — схема пока их не принимает, чтобы не создавать
-  неиспользуемых сущностей.
+- секреты (API-ключи будущей биржи) в конфиге запрещены — только имена
+  env-переменных, значения читаются из окружения (docs/live.md);
+- крипторежим: метки времени CSV по умолчанию трактуются как UTC, рынок 24/7
+  (docs/data.md §2-3); секция биржевого API отсутствует — подключение биржи
+  НЕ реализовано (exchange/base.py, docs/live.md).
 """
 
 from __future__ import annotations
@@ -29,7 +28,6 @@ __all__ = [
     "AppConfig",
     "DataConfig",
     "DaySessionsConfig",
-    "FinamConfig",
     "LabelConfig",
     "RunConfig",
     "SessionsConfig",
@@ -41,6 +39,7 @@ __all__ = [
 
 _STRICT = ConfigDict(extra="forbid")
 _HHMM = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
+_HHMM_END = re.compile(r"^(?:([01]?\d|2[0-3]):([0-5]\d)|24:00)$")
 
 
 def _validate_timezone(value: str) -> str:
@@ -62,11 +61,17 @@ class RunConfig(BaseModel):
 
 
 class SymbolConfig(BaseModel):
+    """Торговая пара криптобиржи (например BTCUSDT или ETH/USDT — формат биржи).
+
+    Тикер — строковый идентификатор пары; сопоставление с реальными инструментами
+    биржи появится вместе с биржевым адаптером (НЕ реализован — exchange/base.py).
+    Прежний формат символа ticker@mic удалён вместе с брокерской интеграцией (docs/decisions.md D12).
+    """
+
     model_config = _STRICT
 
     ticker: str = Field(min_length=1, max_length=32)
-    mic: str = Field(min_length=1, max_length=8)
-    #: файлы истории по таймфреймам: {"1m": "SBER_M1.csv", ...}
+    #: файлы истории по таймфреймам: {"1m": "BTCUSDT_M1.csv", ...}
     files: dict[str, str] = Field(default_factory=dict)
 
     @field_validator("files")
@@ -81,8 +86,8 @@ class SymbolConfig(BaseModel):
 
     @property
     def symbol(self) -> str:
-        """Полный символ в формате API: ticker@mic (docs/research.md S3d)."""
-        return f"{self.ticker}@{self.mic}"
+        """Символ инструмента (для криптопары совпадает с тикером)."""
+        return self.ticker
 
 
 class DataConfig(BaseModel):
@@ -91,10 +96,13 @@ class DataConfig(BaseModel):
     csv_dir: Path = Path("data/raw")
     symbols: list[SymbolConfig] = Field(min_length=1)
     #: ЯВНАЯ семантика метки времени в CSV; значение по умолчанию отсутствует —
-    #: её необходимо подтвердить в конфиге (docs/research.md Q3, decisions D1).
+    #: её необходимо подтвердить в конфиге (docs/data.md §2, decisions D1).
     timestamp_semantics: Literal["bar_open", "bar_close"]
-    source_timezone: str = "Europe/Moscow"
-    volume_units: Literal["pieces"] = "pieces"
+    #: криптобиржи отдают свечи в UTC — соглашение проекта по умолчанию (docs/data.md §2)
+    source_timezone: str = "UTC"
+    #: в каких единицах колонка volume вашей выгрузки: базовый актив (BTC для
+    #: BTCUSDT — стандарт крипто-свечей) или квотирующий (USDT)
+    volume_units: Literal["base_asset", "quote_asset"] = "base_asset"
 
     @field_validator("source_timezone")
     @classmethod
@@ -108,11 +116,20 @@ class SessionWindowConfig(BaseModel):
     start: str
     end: str
 
-    @field_validator("start", "end")
+    @field_validator("start")
     @classmethod
-    def _hhmm(cls, value: str) -> str:
+    def _hhmm_start(cls, value: str) -> str:
         if not _HHMM.match(value):
             raise ValueError(f"Ожидается формат HH:MM, получено {value!r}")
+        return value
+
+    @field_validator("end")
+    @classmethod
+    def _hhmm_end(cls, value: str) -> str:
+        if not _HHMM_END.match(value):
+            raise ValueError(
+                f'Ожидается формат HH:MM (для конца окна допустимо "24:00"), получено {value!r}'
+            )
         return value
 
     @model_validator(mode="after")
@@ -124,7 +141,7 @@ class SessionWindowConfig(BaseModel):
         if minutes(self.start) >= minutes(self.end):
             raise ValueError(
                 f"Окно сессии start={self.start} должно быть раньше end={self.end} "
-                "(окна через полночь не поддерживаются)"
+                '(окна через полночь не поддерживаются; для рынка 24/7 используйте 00:00-24:00)'
             )
         return self
 
@@ -150,7 +167,8 @@ class DaySessionsConfig(BaseModel):
 class SessionsConfig(BaseModel):
     model_config = _STRICT
 
-    timezone: str = "Europe/Moscow"
+    #: время окон сессий; для крипторынка — UTC с окном 00:00-24:00 (рынок 24/7)
+    timezone: str = "UTC"
     days: list[DaySessionsConfig] = Field(min_length=1)
 
     @field_validator("timezone")
@@ -185,7 +203,8 @@ class TimeframeConfig(BaseModel):
     lookback_bars: int = Field(ge=1)
     horizon_bars: int = Field(ge=1)
     #: Базовый таймфрейм для локального ресэмплинга (обязателен для "10m":
-    #: в Finam API таймфрейма M10 не существует — docs/research.md, decisions D3).
+    #: нативных 10-минутных свечей криптобиржи обычно не отдают — 10m строится
+    #: локально из 5m/1m, docs/decisions.md D3).
     base_timeframe: str | None = None
     label: LabelConfig | None = None
 
@@ -324,9 +343,9 @@ class ValidationConfig(BaseModel):
 
 
 class EvaluationConfig(BaseModel):
-    """Параметры оценочной симуляции фазы 3 (упрощённая модель исполнения;
-    полный симулятор — этап B1 roadmap). Значения комиссий/слиппеджа — ОЦЕНОЧНЫЕ
-    допущения, а не фактические тарифы (research Q9)."""
+    """Параметры оценочной симуляции (упрощённая модель исполнения; полный
+    симулятор — execution/simulator.py). Значения комиссий/слиппеджа — ОЦЕНОЧНЫЕ
+    допущения, а не фактические комиссии биржи: уточняйте тарифы своей биржи."""
 
     model_config = _STRICT
 
@@ -335,8 +354,9 @@ class EvaluationConfig(BaseModel):
     #: порог вероятности класса 1 для длинной позиции (классификация);
     #: для регрессии позиция определяется знаком прогноза (docs/ml.md §5)
     decision_threshold: float = Field(default=0.5, gt=0.0, lt=1.0)
-    #: допущения годового пересчёта (docs/ml.md §5.4):
-    trading_days_per_year: int = Field(default=252, ge=100, le=366)
+    #: допущения годового пересчёта (docs/ml.md §5.4). Крипторынок торгуется
+    #: без выходных — 365 дней в году (календарный факт, не финансовое допущение)
+    trading_days_per_year: int = Field(default=365, ge=100, le=366)
     #: None = вывести из данных (медиана баров на торговый день × trading_days_per_year)
     bars_per_year: int | None = Field(default=None, ge=1)
     risk_free_annual: float = Field(default=0.0, ge=0.0, le=0.5)
@@ -401,20 +421,25 @@ class RiskConfig(BaseModel):
 class InstrumentConfig(BaseModel):
     """Параметры инструмента для проверок шага цены и лота (фаза 4).
 
-    Значения должны происходить ИЗ ПОДТВЕРЖДЁННОГО источника: документированные
-    поля Finam GetAsset/GetAssetParams (min_step, decimals, lot_size,
-    trade_lot_size — docs/research.md S3d) или спецификация биржи. Выдумывать
-    параметры запрещено (ТЗ фазы 4); None = параметр не подтверждён — зависимая
-    проверка безопасно откладывается и это фиксируется в журнале/отчёте.
+    Значения должны происходить ИЗ ПОДТВЕРЖДЁННОГО источника: спецификация
+    инструмента криптобиржи (например tickSize/stepSize в exchangeInfo — когда
+    биржевой адаптер будет реализован). Выдумывать параметры запрещено;
+    None = параметр не подтверждён — зависимая проверка безопасно откладывается
+    и это фиксируется в журнале/отчёте.
+
+    Количество криптопар обычно дробное (stepSize вроде 0.00001 BTC);
+    целочисленный lot_size_units — консервативное ограничение текущей схемы,
+    вопрос дробных количеств отложен до подключения биржи (docs/decisions.md D14).
     """
 
     model_config = _STRICT
 
-    #: шаг цены в валюте котировки (= min_step / 10^decimals у Finam)
+    #: минимальный шаг цены в квотирующей валюте (tickSize биржи)
     price_step: float | None = Field(default=None, gt=0.0)
-    #: штук в лоте (Finam lot_size / trade_lot_size; 0 у Finam = «недоступно»)
+    #: минимальный шаг количества в единицах базового актива (stepSize/lotSize
+    #: биржи), целым числом; 1 = без дробления (дробные количества — D14, будущее)
     lot_size_units: int | None = Field(default=None, ge=1)
-    #: валюта котировки — только для отчётов/журнала
+    #: валюта котировки (например USDT) — только для отчётов/журнала
     quote_currency: str | None = Field(default=None, min_length=3, max_length=8)
 
 
@@ -445,15 +470,21 @@ class SignalConfig(BaseModel):
 class LiveConfig(BaseModel):
     """Граница LIVE (docs/live.md). По умолчанию всё выключено.
 
-    Для разрешения ордерного контура требуется ОДНОВРЕМЕННО (многофакторный гейт,
-    без скрытых обходов и fallback):
-    1. run.mode: LIVE в конфиге;
-    2. явный флаг CLI --allow-live у команды live-preflight/live;
-    3. переменная окружения TRADEBOT_LIVE_ACK со значением-подтверждением;
-    4. live.allow_orders: true в отдельной секции;
-    5. заданные env секрет и демо-счёт, подтверждённые параметры инструмента
-       (price_step, lot_size_units), полный risk-конфиг, live.max_order_quantity_units;
-    6. отсутствие файла kill-switch.
+    ВАЖНО: в крипто-версии проекта биржевой адаптер НЕ реализован
+    (exchange/base.py), поэтому LIVE-гейт дополнительно требует факта
+    «интеграция с биржей доступна» и сейчас НЕ ПРОХОДИТ НИКОГДА — LIVE
+    безопасно заблокирован до отдельной реализации подключения к бирже.
+
+    Для разрешения ордерного контура (после реализации адаптера) потребуется
+    ОДНОВРЕМЕННО (многофакторный гейт, без скрытых обходов и fallback):
+    1. реализованный и включённый биржевой адаптер (сейчас отсутствует);
+    2. run.mode: LIVE в конфиге;
+    3. явный флаг CLI --allow-live у команды live-preflight/live;
+    4. переменная окружения TRADEBOT_LIVE_ACK со значением-подтверждением;
+    5. live.allow_orders: true в отдельной секции;
+    6. подтверждённые параметры инструмента (price_step, lot_size_units),
+       полный risk-конфиг, live.max_order_quantity_units;
+    7. отсутствие файла kill-switch.
     Любое невыполненное условие -> безопасный отказ ДО сетевых вызовов.
     """
 
@@ -498,37 +529,6 @@ class SimulationConfig(BaseModel):
     journal_path: str | None = None
 
 
-class FinamConfig(BaseModel):
-    """Настройки read-only адаптера Finam Trade API (docs/research.md §2).
-
-    Секретов здесь нет и быть не может — только ИМЕНА переменных окружения.
-    """
-
-    model_config = _STRICT
-
-    base_url: str = "https://api.finam.ru"
-    timeout_seconds: float = Field(default=15.0, gt=0.0, le=120.0)
-    #: документированный лимит — 200 запросов/минуту НА МЕТОД (research S3a/S4)
-    rate_limit_per_minute: int = Field(default=200, ge=1, le=200)
-    max_get_attempts: int = Field(default=4, ge=1, le=10)
-    secret_env_var: str = "TRADE_API_SECRET"
-    account_id_env_var: str = "FINAM_ACCOUNT_ID"
-    #: Семантика timestamp свечей API документацией НЕ зафиксирована (research Q3).
-    #: None — адаптер откажется нормализовать бары, пока значение не задано явно
-    #: (в конфиге или CLI-флаге). Молчаливое угадывание запрещено (decisions D1).
-    bar_timestamp_semantics: Literal["bar_open", "bar_close"] | None = None
-
-    @field_validator("base_url")
-    @classmethod
-    def _https_only(cls, value: str) -> str:
-        if not value.startswith("https://"):
-            raise ValueError(
-                f"base_url должен использовать https (получено {value!r}); "
-                "http допустим только для локального тестового сервера и отключён в схеме"
-            )
-        return value.rstrip("/")
-
-
 class AppConfig(BaseModel):
     model_config = _STRICT
 
@@ -537,7 +537,6 @@ class AppConfig(BaseModel):
     timeframes: dict[str, TimeframeConfig] = Field(min_length=1)
     sessions: SessionsConfig | None = None
     validation: ValidationConfig = Field(default_factory=ValidationConfig)
-    finam: FinamConfig = Field(default_factory=FinamConfig)
     features: FeaturesConfig = Field(default_factory=FeaturesConfig)
     model: ModelConfig = Field(default_factory=ModelConfig)
     evaluation: EvaluationConfig = Field(default_factory=EvaluationConfig)
@@ -547,7 +546,8 @@ class AppConfig(BaseModel):
     risk: RiskConfig | None = None
     instrument: InstrumentConfig | None = None
     simulation: SimulationConfig | None = None
-    #: фаза 5: граница LIVE (docs/live.md). По умолчанию None — LIVE-контур закрыт.
+    #: граница LIVE (docs/live.md). По умолчанию None — LIVE-контур закрыт;
+    #: дополнительно заблокирован отсутствием биржевого адаптера (exchange/base.py).
     live: LiveConfig | None = None
 
     @field_validator("timeframes")
@@ -563,14 +563,14 @@ class AppConfig(BaseModel):
 
     @model_validator(mode="after")
     def _derived_timeframes_have_base(self) -> "AppConfig":
-        """10m обязан иметь base_timeframe (M10 в API нет — decisions D3);
+        """10m обязан иметь base_timeframe (decisions D3);
         для остальных base_timeframe, если задан, должен быть мельче и кратен."""
         tf_minutes = {"1m": 1, "5m": 5, "10m": 10, "15m": 15, "1h": 60}
         for name, cfg in self.timeframes.items():
             if name == "10m" and cfg.base_timeframe is None:
                 raise ValueError(
-                    "timeframes.'10m': base_timeframe обязателен — Finam API не предоставляет "
-                    "TIME_FRAME_M10 (docs/research.md §6, decisions D3); укажите '5m' или '1m'"
+                    "timeframes.'10m': base_timeframe обязателен — нативных 10m-свечей "
+                    "источник обычно не предоставляет (docs/decisions.md D3); укажите '5m' или '1m'"
                 )
             if cfg.base_timeframe is not None:
                 base = tf_minutes[cfg.base_timeframe]

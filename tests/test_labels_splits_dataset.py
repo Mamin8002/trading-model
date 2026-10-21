@@ -123,7 +123,7 @@ def small_dataset():
         lookback_bars=240,
         label_cfg=LabelConfig(kind="fwd_return_class", neutral_band_bps=5.0),
         features_cfg=FeaturesConfig(),
-        symbol="SYNTH@DEMO",
+        symbol="SYNTH-USDT",
     )
 
 

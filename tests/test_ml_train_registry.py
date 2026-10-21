@@ -22,9 +22,9 @@ BASE_CONFIG = {
     "run": {"mode": "TEST", "experiment_id": "test-ml"},
     "data": {
         "csv_dir": "data/raw",
-        "symbols": [{"ticker": "SYNTH", "mic": "DEMO", "files": {}}],
+        "symbols": [{"ticker": "SYNTH-USDT", "files": {}}],
         "timestamp_semantics": "bar_open",
-        "source_timezone": "Europe/Moscow",
+        "source_timezone": "UTC",
     },
     "timeframes": {
         "5m": {
@@ -195,7 +195,7 @@ class TestRegistry:
         bundle.validate_compatibility(
             timeframe="5m", feature_names=bundle.feature_names, horizon_bars=4, label_kind="fwd_return_class"
         )
-        proba = bundle.predict_proba(bars[100:160], local_timezone="Europe/Moscow")
+        proba = bundle.predict_proba(bars[100:160], local_timezone="UTC")
         assert proba.shape == (60,)
         assert np.isfinite(proba).all()
         assert ((proba >= 0.0) & (proba <= 1.0)).all()

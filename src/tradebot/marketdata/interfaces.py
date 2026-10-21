@@ -1,21 +1,20 @@
 """Интерфейсы источников рыночных данных (docs/architecture.md §2, §4.3).
 
-Границы:
-- ``HistorySource`` — история свечей (CSV-replay в TEST, Finam REST в LIVE);
-- ``QuoteSnapshotSource`` / ``OrderBookSnapshotSource`` — снимки котировки и стакана
-  (REST-методы документированы и подтверждены: docs/research.md §2.4, §2.5);
-- ``StreamSource`` — контракт потоковых подписок. Документацией подтверждены
-  WebSocket (wss://api.finam.ru/ws, SUBSCRIBE после HANDSHAKE_SUCCESS, конверты
-  DATA/ERROR/EVENT; AsyncAPI v1.0.0) и gRPC-стримы SDK (SubscribeBars/SubscribeQuote/
-  SubscribeOrderBook/SubscribeLatestTrades). РЕАЛИЗАЦИЯ потока — этап L2 roadmap:
-  в этой фазе определён только интерфейс, чтобы транспорт выбирался позже без
-  изменения потребителей (decisions D7: транспорт за интерфейсом).
+Это бирженезависимые контракты (порты): будущий адаптер криптобиржи реализует
+их без изменения потребителей. Реализация адаптера НЕ выполнена — подключение
+биржи отложено (exchange/base.py, docs/live.md); сейчас единственный источник
+данных — локальные CSV (CsvHistorySource, TEST-режим).
 
-Стакан: наличие и формат снимка ПОДТВЕРЖДЕНЫ документацией
-(GET /v1/instruments/{symbol}/orderbook; rows: price, buy_size|sell_size,
-action ADD/REMOVE/UPDATE, mpid, timestamp — research §2.5), поэтому снимок
-реализован. Гарантированная глубина (число уровней) документацией НЕ задана
-(research Q4) — потребители не должны рассчитывать на фиксированную глубину.
+Границы:
+- ``HistorySource`` — история свечей (CSV-replay в TEST; REST биржи — в будущем);
+- ``QuoteSnapshotSource`` / ``OrderBookSnapshotSource`` — снимки котировки и
+  стакана (для будущего адаптера; конкретные форматы ответов биржи здесь НЕ
+  фиксируются — приведение к этим типам делает адаптер);
+- ``StreamSource`` — контракт потоковых подписок (WebSocket биржи — будущий
+  этап; транспорт выбирается за интерфейсом, docs/decisions.md D7).
+
+Стакан: гарантированная глубина (число уровней) НЕ предполагается —
+потребители не должны рассчитывать на фиксированную глубину.
 """
 
 from __future__ import annotations
@@ -49,12 +48,12 @@ class OrderBookLevelSide(str, Enum):
 
 
 class OrderBookRowAction(str, Enum):
-    """Действие уровня стакана (подтверждено proto: ACTION_ADD/REMOVE/UPDATE)."""
+    """Действие уровня стакана (в терминах дельта-потоков биржи)."""
 
-    UNSPECIFIED = "ACTION_UNSPECIFIED"
-    REMOVE = "ACTION_REMOVE"
-    ADD = "ACTION_ADD"
-    UPDATE = "ACTION_UPDATE"
+    UNSPECIFIED = "unspecified"
+    REMOVE = "remove"
+    ADD = "add"
+    UPDATE = "update"
 
 
 @dataclass(frozen=True)
@@ -63,7 +62,6 @@ class OrderBookRow:
     size: Decimal
     side: OrderBookLevelSide
     action: OrderBookRowAction = OrderBookRowAction.UNSPECIFIED
-    mpid: str | None = None
     timestamp: datetime | None = None
 
 
@@ -80,7 +78,7 @@ class OrderBookSnapshot:
 
 @dataclass(frozen=True)
 class QuoteSnapshot:
-    """Снимок последней котировки (поля подтверждены research §2.4/S3e и proto Quote)."""
+    """Снимок последней котировки (бирженезависимый набор полей)."""
 
     symbol: str
     timestamp: datetime | None
@@ -103,8 +101,7 @@ class HistorySource(ABC):
         start_utc: datetime,
         end_utc: datetime,
     ) -> list[Bar]:
-        """Свечи за [start_utc, end_utc) — границы как в документированном API
-        (start включительно, end исключительно; research §2.3)."""
+        """Свечи за [start_utc, end_utc): start включительно, end исключительно."""
         raise NotImplementedError
 
 
@@ -121,15 +118,16 @@ class OrderBookSnapshotSource(ABC):
 
 
 class StreamSource(ABC):
-    """Контракт потоковых подписок (реализация — этап L2, см. docstring модуля).
+    """Контракт потоковых подписок (реализация — будущий этап, см. docstring модуля).
 
-    Семантика (подтверждена документацией, research §2.4):
+    Ожидаемая семантика криптобиржевых потоков (учесть в будущем адаптере):
     - поток может повторно присылать свечу с тем же timestamp (мутация незакрытого
       бара); завершённой свеча считается только после появления бара с более
-      поздним timestamp — потребитель обязан применять BarFinalizer (этап L2);
+      поздним timestamp или явного флага закрытия — потребитель обязан применять
+      BarFinalizer;
     - пропущенные во время обрыва события не доставляются: после переподключения
       требуется REST-снимок и сверка;
-    - ``is_data_snapshot`` отличает начальный снимок от инкрементальных обновлений.
+    - начальный снимок (snapshot) отличается от инкрементальных обновлений.
     """
 
     @abstractmethod
@@ -156,7 +154,7 @@ class CsvHistorySource(HistorySource):
         self,
         files_by_timeframe: dict[str, "str | object"],
         *,
-        source_timezone: str = "Europe/Moscow",
+        source_timezone: str = "UTC",
         timestamp_semantics: "str" = "bar_open",
         symbol: str = "",
         calendar: "object | None" = None,

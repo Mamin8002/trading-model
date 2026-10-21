@@ -79,7 +79,7 @@ def assemble_dataset(
     label_cfg,
     features_cfg,
     symbol: str = "",
-    local_timezone: str = "Europe/Moscow",
+    local_timezone: str = "UTC",
 ) -> MlDataset:
     """Собирает датасет из финальных баров одного символа и таймфрейма."""
     tf = Timeframe.parse(timeframe)

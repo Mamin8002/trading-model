@@ -1,16 +1,19 @@
 """SessionCalendar — торговые сессии и часовой пояс (docs/architecture.md §3.3).
 
-Принципы (по исследованию docs/research.md, Q5):
-- Точные расписания сессий MOEX меняются и зависят от класса инструмента; мы НЕ
-  хардкодим биржевые правила. Календарь задаётся конфигурацией, а в LIVE сверяется
-  с документированным методом Schedule (GET /v1/assets/{symbol}/schedule).
+Принципы (криптовалютный режим, docs/data.md):
+- Крипторынок работает КРУГЛОСУТОЧНО (24/7): базовое ожидание — непрерывная сетка
+  баров в UTC. Для этого есть готовый календарь ``always_on_calendar()`` (окно
+  00:00-24:00 во все дни недели) — рекомендованный календарь крипто-конфигов.
+- Биржевые расписания (техобслуживания и пр.) мы НЕ хардкодим: если конкретная
+  биржа/инструмент имеет окна торгов, календарь задаётся конфигурацией.
 - Календарь может быть отключён (None): тогда полнота интервалов проверяется только
   по равномерной сетке, а разрывы сообщаются как warnings.
 - Бары вне сессий не фабрикуются: календарь используется для (а) подсчёта ожидаемого
   числа слотов при ресэмплинге и (б) пометки баров вне сессий валидатором.
 
-Поддерживаются сессионные окна внутри одних суток (start < end, без ночных переходов).
-Время окон — локальное время биржи (по умолчанию Europe/Moscow).
+Поддерживаются сессионные окна внутри одних суток (start < end; конец "24:00"
+разрешён и означает полночь, т.е. окно на все сутки). Время окон — локальное время
+календаря (по умолчанию UTC — единая зона крипторынка).
 """
 
 from __future__ import annotations
@@ -23,14 +26,19 @@ from zoneinfo import ZoneInfo
 
 from .bar import UTC, Timeframe, floor_to_grid
 
-__all__ = ["DayRule", "SessionCalendar", "SessionWindow"]
+__all__ = ["DayRule", "SessionCalendar", "SessionWindow", "always_on_calendar"]
 
 _HHMM_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
+_HHMM_END_RE = re.compile(r"^(?:([01]?\d|2[0-3]):([0-5]\d)|24:00)$")
 
 
 @dataclass(frozen=True)
 class SessionWindow:
-    """Окно сессии в локальном времени биржи, start включительно, end исключительно."""
+    """Окно сессии в локальном времени календаря, start включительно, end исключительно.
+
+    end может быть "24:00" (конец суток) — это позволяет выразить круглосуточное
+    окно 00:00-24:00 для рынков 24/7 (криптовалюты).
+    """
 
     start: timedelta
     end: timedelta
@@ -44,13 +52,17 @@ class SessionWindow:
 
     @classmethod
     def parse(cls, start: str, end: str) -> "SessionWindow":
-        return cls(_parse_hhmm(start, "start"), _parse_hhmm(end, "end"))
+        return cls(_parse_hhmm(start, "start"), _parse_hhmm(end, "end", allow_24=True))
 
 
-def _parse_hhmm(value: str, field: str) -> timedelta:
-    match = _HHMM_RE.match(value.strip())
+def _parse_hhmm(value: str, field: str, *, allow_24: bool = False) -> timedelta:
+    pattern = _HHMM_END_RE if allow_24 else _HHMM_RE
+    match = pattern.match(value.strip())
     if not match:
-        raise ValueError(f"Неверный формат времени {field}={value!r}, ожидается HH:MM (например 10:00)")
+        hint = ', конец окна может быть "24:00"' if allow_24 else ""
+        raise ValueError(f"Неверный формат времени {field}={value!r}, ожидается HH:MM (например 10:00){hint}")
+    if allow_24 and match.group(1) is None:
+        return timedelta(hours=24)
     hours, minutes = int(match.group(1)), int(match.group(2))
     return timedelta(hours=hours, minutes=minutes)
 
@@ -134,3 +146,13 @@ class SessionCalendar:
     ) -> list[datetime]:
         """Слоты сетки, являющиеся торговым временем (используется для ожидаемого покрытия)."""
         return [slot for slot in self.grid_slots(start_utc, end_utc, step) if self.is_trading_time(slot)]
+
+
+def always_on_calendar(timezone: str = "UTC") -> SessionCalendar:
+    """Календарь 24/7 — рекомендованный для крипторынка (торги без выходных).
+
+    Окно 00:00-24:00 во все дни недели: любой момент является «торговым временем»,
+    поэтому ожидаемое покрытие при валидации/ресэмплинге — непрерывная сетка UTC.
+    """
+    rule = DayRule(frozenset(range(7)), (SessionWindow(timedelta(0), timedelta(hours=24)),))
+    return SessionCalendar(timezone, (rule,))

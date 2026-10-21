@@ -307,8 +307,8 @@ def aggregate_trading(segments: list[TradingStats]) -> TradingStats:
 def derive_bars_per_year(
     ts: np.ndarray,
     *,
-    trading_days_per_year: int = 252,
-    local_timezone: str = "Europe/Moscow",
+    trading_days_per_year: int = 365,
+    local_timezone: str = "UTC",
     config_override: int | None = None,
 ) -> tuple[float, float | None, str]:
     """(bars_per_year, bars_per_day_median, source).

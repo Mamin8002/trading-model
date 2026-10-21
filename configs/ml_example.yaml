@@ -1,6 +1,7 @@
-# ПРИМЕР конфигурации обучения (фаза 3). Скопируйте и заполните под свои данные.
-# Базовые секции (run/data/timeframes/sessions/validation/finam) описаны в
-# configs/example.yaml и docs/data.md; ML-секции — в docs/ml.md.
+# ПРИМЕР конфигурации обучения (ML-контур, docs/ml.md) для криптоданных.
+# Скопируйте и заполните под свои данные. Базовые секции (run/data/timeframes/
+# sessions/validation) описаны в configs/example.yaml и docs/data.md;
+# ML-секции — в docs/ml.md.
 #
 # Все значения lookback_bars / horizon_bars / периоды индикаторов / параметры
 # модели / пороги — ЯВНЫЕ: подбирайте их до запуска и фиксируйте (decisions D6:
@@ -8,21 +9,20 @@
 
 run:
   mode: TEST
-  experiment_id: sber-5m-ml-v1
+  experiment_id: btcusdt-5m-ml-v1
   model_dir: models        # каталог артефактов моделей (исключён из git)
   report_dir: reports      # каталог отчётов (исключён из git)
 
 data:
   csv_dir: data/raw
   symbols:
-    - ticker: SBER
-      mic: MISX
+    - ticker: BTCUSDT
       files:
-        "1m": SBER_M1.csv      # ваши файлы; имена — заглушки-примеры
-        "5m": SBER_M5.csv
+        "1m": BTCUSDT_M1.csv      # ваши файлы; имена — заглушки-примеры
+        "5m": BTCUSDT_M5.csv
   timestamp_semantics: bar_open   # подтвердите по вашим данным (docs/data.md §2)
-  source_timezone: Europe/Moscow
-  volume_units: pieces
+  source_timezone: UTC            # криптобиржи отдают свечи в UTC
+  volume_units: base_asset
 
 timeframes:
   "5m":
@@ -35,7 +35,7 @@ timeframes:
       neutral_band_bps: 5.0  # ≈ комиссия + слиппедж на сторону; движение в полосе не торгуется
   "10m":
     enabled: false
-    base_timeframe: "5m"     # ОБЯЗАТЕЛЬНО: в Finam API нет TIME_FRAME_M10 (decisions D3)
+    base_timeframe: "5m"     # ОБЯЗАТЕЛЬНО: 10m строится локально из 5m (decisions D3)
     lookback_bars: 120
     horizon_bars: 3
     label: { kind: fwd_return_class, neutral_band_bps: 6.0 }
@@ -55,7 +55,7 @@ features:
     volume_trend_window: 60
 
 model:
-  kind: lightgbm             # catboost в фазе 3 не подключён (decisions D4/P1)
+  kind: lightgbm             # catboost не подключён (decisions D4/P1)
   seed: 42                   # фиксированный seed — воспроизводимость
   params:
     n_estimators: 300
@@ -86,21 +86,17 @@ validation:
     min_oos_trades: 20
 
 evaluation:                  # допущения оценочной симуляции (docs/ml.md §5)
-  commission_bps: 3.0        # ОЦЕНОЧНОЕ допущение, не фактический тариф (research Q9)
+  commission_bps: 3.0        # ОЦЕНОЧНОЕ допущение, не фактическая комиссия биржи
   slippage_bps: 2.0          # ОЦЕНОЧНОЕ допущение
   decision_threshold: 0.5    # P(up) >= порога -> длинная позиция (long-only)
-  trading_days_per_year: 252
-  bars_per_year: null        # null = вывести из данных (медиана баров/день × 252)
+  trading_days_per_year: 365 # крипторынок торгуется без выходных (docs/data.md §3)
+  bars_per_year: null        # null = вывести из данных (медиана баров/день × trading_days_per_year)
   risk_free_annual: 0.0
 
+# Крипторынок 24/7: круглосуточный календарь (можно не задавать sessions вовсе)
 sessions:
-  timezone: Europe/Moscow
+  timezone: UTC
   days:
-    - days: [0, 1, 2, 3, 4]
+    - days: [0, 1, 2, 3, 4, 5, 6]
       sessions:
-        - { start: "10:00", end: "18:50" }   # ПРИМЕР — сверьте с фактическим расписанием
-        - { start: "19:05", end: "23:50" }   # ПРИМЕР
-
-finam:
-  base_url: https://api.finam.ru
-  bar_timestamp_semantics: null  # задайте после эмпирической проверки (research Q3)
+        - { start: "00:00", end: "24:00" }

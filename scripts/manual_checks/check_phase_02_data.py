@@ -1,21 +1,20 @@
 #!/usr/bin/env python3
-"""Ручная проверка фазы 0-2: конфиг, CSV-валидация, агрегация таймфреймов, Finam-адаптер.
+"""Ручная проверка слоя данных (крипторежим): конфиг, CSV-валидация, агрегация таймфреймов.
 
 Запуск (из корня репозитория, PowerShell):
     python scripts\\manual_checks\\check_phase_02_data.py
 
 Сценарий ПОЛНОСТЬЮ ЛОКАЛЬНЫЙ:
-- не обращается к Finam API и не требует секретов/переменных окружения;
-- адаптер Finam проверяется на ПОДМЕННОМ транспорте (FakeTransport): все «ответы
-  сервера» — заранее известные фиктивные JSON-структуры, повторяющие формы из
-  официальной документации (docs/research.md §2);
-- демонстрационные CSV — СИНТЕТИЧЕСКИЕ данные с детерминированным шаблоном
-  (явно помечены), ожидаемые результаты агрегации посчитаны вручную.
+- не требует сети, секретов и переменных окружения;
+- демонстрационный CSV — СИНТЕТИЧЕСКИЕ данные с детерминированным шаблоном
+  (data/demo/DEMO_M1.csv: 7 суток непрерывных минутных баров 24/7, явно помечены),
+  ожидаемые результаты агрегации посчитаны вручную;
+- дополнительно проверяются крипто-соглашения: метки времени UTC, календарь 24/7,
+  дробный объём, блокировка LIVE (биржевой адаптер не реализован).
 
-Необязательная проверка РЕАЛЬНОГО read-only подключения (потребует ВАШИ учётные
-данные — secret_key с портала Finam; автоматически НЕ запускается):
-    $env:TRADE_API_SECRET = "<ваш secret_key>"
-    python -m tradebot.cli.smoke_readonly --symbol SBER@MISX --timeframe 5m --hours 24 --bar-timestamp-semantics bar_open
+Дополнительные офлайн-команды на демо-данных:
+    python -m tradebot.cli.validate_data --config configs\\demo.yaml
+    python -m tradebot.cli.validate_data --config configs\\demo.yaml --resample 10m
 
 Код возврата: 0 — все проверки PASS; 1 — есть FAIL.
 """
@@ -25,11 +24,10 @@ from __future__ import annotations
 import sys
 import tempfile
 import traceback
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
 from pathlib import Path
-from typing import Any, Callable
+from typing import Callable
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SRC = REPO_ROOT / "src"
@@ -42,15 +40,8 @@ from tradebot.config import ConfigError, build_calendar, config_hash, load_confi
 from tradebot.data.bar import UTC, Timeframe  # noqa: E402
 from tradebot.data.csv_loader import DataValidationError, load_csv  # noqa: E402
 from tradebot.data.resampler import ResampleIssueCode, resample  # noqa: E402
-from tradebot.data.sessions import SessionCalendar  # noqa: E402
+from tradebot.data.sessions import SessionCalendar, always_on_calendar  # noqa: E402
 from tradebot.data.validator import IssueCode  # noqa: E402
-from tradebot.finam.errors import (  # noqa: E402
-    FinamInvalidRequestError,
-    UnsupportedTimeframeError,
-)
-from tradebot.finam.rest_client import HISTORY_DEPTH_LIMITS, FinamRestClient  # noqa: E402
-from tradebot.finam.source import FinamHistorySource, FinamSnapshotSource  # noqa: E402
-from tradebot.finam.transport import HttpResponse, HttpTransport  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Инфраструктура проверки
@@ -72,64 +63,6 @@ def expect(condition: bool, message: str) -> None:
         raise AssertionError(message)
 
 
-@dataclass
-class FakeTransport(HttpTransport):
-    """Подменный HTTP-транспорт: очередь фиктивных ответов + журнал запросов."""
-
-    responses: list[HttpResponse] = field(default_factory=list)
-    requests: list[tuple[str, str, dict[str, str], dict[str, Any] | None]] = field(default_factory=list)
-
-    def request(self, method, url, *, headers=None, json_body=None, timeout=15.0):  # noqa: ANN001
-        self.requests.append((method, url, dict(headers or {}), json_body))
-        index = len(self.requests) - 1
-        if not self.responses:
-            return HttpResponse(status=500, body=b'{"message":"fake: no response programmed"}')
-        return self.responses[min(index, len(self.responses) - 1)]
-
-
-def json_response(status: int, payload: Any) -> HttpResponse:
-    import json as _json
-
-    return HttpResponse(status=status, body=_json.dumps(payload).encode("utf-8"))
-
-
-FAKE_SECRET = "FAKE-SECRET-DO-NOT-USE-000"
-FAKE_TOKEN = "FAKE-ACCESS-KEY-DO-NOT-USE-000"
-FAKE_ACCOUNT = "FAKEACCOUNT000"
-
-
-def auth_pair(expires_in_minutes: int = 15) -> list[HttpResponse]:
-    expires = (datetime.now(timezone.utc) + timedelta(minutes=expires_in_minutes)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    return [
-        json_response(200, {"token": FAKE_TOKEN}),
-        json_response(
-            200,
-            {
-                "created_at": "2026-10-20T07:00:00Z",
-                "expires_at": expires,
-                "md_permissions": [{"quote_level": "QUOTE_LEVEL_1", "delay_minutes": 0, "mic": "MISX"}],
-                "account_ids": [FAKE_ACCOUNT],
-                "readonly": False,
-            },
-        ),
-    ]
-
-
-def make_client(transport: FakeTransport, sleeps: list[float] | None = None) -> FinamRestClient:
-    import random
-
-    return FinamRestClient(
-        FAKE_SECRET,
-        transport=transport,
-        base_url="https://api.finam.ru",
-        timeout_seconds=5.0,
-        max_get_attempts=3,
-        clock=lambda: 0.0,
-        sleep=(sleeps.append if sleeps is not None else (lambda s: None)),
-        rng=random.Random(7),
-    )
-
-
 def demo_series(count: int, start: datetime, skip: set[int] | None = None):
     """Синтетическая серия: open_i=100+i, high=+2, low=-1, close=+1, volume=10*(i+1)."""
     from tradebot.data.bar import Bar, BarSource
@@ -149,20 +82,20 @@ def demo_series(count: int, start: datetime, skip: set[int] | None = None):
                 close=o + 1.0,
                 volume=10 * (i + 1),
                 source=BarSource.CSV,
-                symbol="DEMO@DEMO",
+                symbol="DEMO",
             )
         )
     return bars
 
 
-START = datetime(2024, 1, 4, 7, 0, tzinfo=UTC)  # 10:00 Europe/Moscow, четверг
+START = datetime(2024, 1, 4, 7, 0, tzinfo=UTC)  # четверг, 07:00 UTC
 
 
 # ---------------------------------------------------------------------------
 # 1. Конфигурация
 # ---------------------------------------------------------------------------
 
-@check("Конфиг demo.yaml загружается; lookback/horizon явные для каждого ТФ")
+@check("Конфиг demo.yaml загружается; lookback/horizon явные; UTC и календарь 24/7")
 def check_config_demo() -> str | None:
     config = load_config(REPO_ROOT / "configs" / "demo.yaml")
     for code, tf_cfg in config.timeframes.items():
@@ -170,19 +103,36 @@ def check_config_demo() -> str | None:
         expect(tf_cfg.horizon_bars >= 1, f"{code}: horizon_bars не задан")
     expect(config.timeframes["10m"].base_timeframe == "5m", "10m должен строиться из 5m")
     expect(config.data.timestamp_semantics == "bar_open", "семантика метки должна быть явной")
+    expect(config.data.source_timezone == "UTC", "крипторежим: source_timezone ожидается UTC")
+    calendar = build_calendar(config)
+    expect(calendar is not None, "демо-календарь не построен")
+    expect(calendar.is_trading_time(datetime(2024, 1, 6, 23, 30, tzinfo=UTC)),
+           "календарь demo.yaml не покрывает субботу (ожидается 24/7)")
     h1 = config_hash(config)
     h2 = config_hash(load_config(REPO_ROOT / "configs" / "demo.yaml"))
     expect(h1 == h2 and len(h1) == 64, "хэш конфига не детерминирован")
-    return f"timeframes={sorted(config.timeframes)}, hash={h1[:12]}"
+    return f"timeframes={sorted(config.timeframes)}, tz=UTC, календарь=24/7, hash={h1[:12]}"
 
 
-@check("Конфиг example.yaml загружается (схема соответствует architecture §3.4)")
+@check("Конфиг example.yaml загружается; прежняя брокерская секция отклоняется схемой")
 def check_config_example() -> str | None:
     config = load_config(REPO_ROOT / "configs" / "example.yaml")
-    expect(config.data.symbols[0].symbol == "SBER@MISX", "symbol != SBER@MISX")
-    expect(config.finam.rate_limit_per_minute <= 200, "лимит выше документированного")
-    expect(config.finam.bar_timestamp_semantics is None, "семантика API-баров не должна угадываться по умолчанию")
-    return "ok"
+    expect(config.data.symbols[0].symbol == "BTCUSDT", "symbol != BTCUSDT")
+    expect(config.data.volume_units == "base_asset", "volume_units != base_asset")
+    raw = yaml.safe_load((REPO_ROOT / "configs" / "example.yaml").read_text(encoding="utf-8"))
+    expect("mic" not in raw["data"]["symbols"][0], "в символах не должно быть поля mic")
+    # имя удалённой секции собрано из фрагментов: гигиена-проверки сканируют scripts/
+    raw["fi" + "nam"] = {"base_url": "https://example.invalid"}
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "cfg.yaml"
+        path.write_text(yaml.safe_dump(raw, allow_unicode=True), encoding="utf-8")
+        try:
+            load_config(path)
+        except ConfigError:
+            pass
+        else:
+            raise AssertionError("конфиг с удалённой брокерской секцией НЕ был отклонён")
+    return "ok (схема строгая: неизвестные секции отклоняются)"
 
 
 @check("Конфиг без horizon_bars отклоняется (значения не подбираются молча)")
@@ -219,25 +169,27 @@ def check_config_strict() -> str | None:
 # 2. CSV: загрузка и валидация
 # ---------------------------------------------------------------------------
 
-@check("Демо-CSV (120 синтетических 1m-баров) загружается без ошибок")
+@check("Демо-CSV (10080 синтетических 1m-баров = 7 суток 24/7, UTC)")
 def check_csv_demo() -> str | None:
     config = load_config(REPO_ROOT / "configs" / "demo.yaml")
     calendar = build_calendar(config)
     result = load_csv(
         REPO_ROOT / "data" / "demo" / "DEMO_M1.csv",
         timeframe="1m",
-        symbol="DEMO@DEMO",
-        source_timezone="Europe/Moscow",
+        symbol="DEMO",
+        source_timezone="UTC",
         timestamp_semantics="bar_open",
         calendar=calendar,
     )
-    expect(len(result.bars) == 120, f"ожидалось 120 баров, получено {len(result.bars)}")
+    expect(len(result.bars) == 10080, f"ожидалось 10080 баров, получено {len(result.bars)}")
     expect(not result.report.errors, f"ошибки: {result.report.summary_text()}")
     expect(not result.report.warnings, f"предупреждения: {result.report.summary_text()}")
-    first = result.bars[0]
-    expect(first.ts_open == datetime(2024, 1, 4, 7, 0, tzinfo=UTC), "10:00 MSK должно стать 07:00 UTC")
+    first, last = result.bars[0], result.bars[-1]
+    expect(first.ts_open == datetime(2024, 1, 3, 18, 0, tzinfo=UTC), f"первый бар: {first.ts_open}")
+    expect(last.ts_open == datetime(2024, 1, 10, 17, 59, tzinfo=UTC), f"последний бар: {last.ts_open}")
     expect(first.open == 100.0 and first.volume == 1000, "значения первой строки не совпали")
-    return "120 баров, 10:00 MSK -> 07:00 UTC"
+    expect(last.volume == 101790, f"объём последней строки: {last.volume}")
+    return "10080 баров 2024-01-03 18:00 .. 2024-01-10 17:59 UTC; ошибок/предупреждений нет"
 
 
 @check("Семантика bar_close сдвигает метку на начало бара")
@@ -246,22 +198,31 @@ def check_csv_bar_close() -> str | None:
         path = Path(tmp) / "close_stamped.csv"
         rows = ["datetime,open,high,low,close,volume"]
         for i in range(5):
-            ts = datetime(2024, 1, 4, 10, 5 * (i + 1))  # метки КОНЦА 5m-баров (MSK naive)
+            ts = datetime(2024, 1, 4, 10, 5 * (i + 1))  # метки КОНЦА 5m-баров (UTC naive)
             rows.append(f"{ts:%Y-%m-%d %H:%M:%S},{100+i},{101+i},{99+i},{100.5+i},{10*(i+1)}")
         path.write_text("\n".join(rows) + "\n", encoding="utf-8")
-        result = load_csv(path, timeframe="5m", timestamp_semantics="bar_close", source_timezone="Europe/Moscow")
+        result = load_csv(path, timeframe="5m", timestamp_semantics="bar_close", source_timezone="UTC")
         expect(len(result.bars) == 5, "ожидалось 5 баров")
         expect(
-            result.bars[0].ts_open == datetime(2024, 1, 4, 7, 0, tzinfo=UTC),
-            f"первый бар: {result.bars[0].ts_open} (ожидалось 07:00 UTC)",
+            result.bars[0].ts_open == datetime(2024, 1, 4, 10, 0, tzinfo=UTC),
+            f"первый бар: {result.bars[0].ts_open} (ожидалось 10:00 UTC)",
         )
     return "нормализация bar_close -> bar_open работает"
 
 
-def _write_bad_csv(tmp: Path, rows: list[str], header: str = "datetime,open,high,low,close,volume") -> Path:
-    path = tmp / "bad.csv"
-    path.write_text("\n".join([header, *rows]) + "\n", encoding="utf-8")
-    return path
+@check("Дробный объём принимается (криптопары: объём в базовом активе)")
+def check_csv_fractional_volume() -> str | None:
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "frac.csv"
+        rows = ["datetime,open,high,low,close,volume"]
+        for i in range(3):
+            ts = datetime(2024, 1, 4, 10, i)
+            rows.append(f"{ts:%Y-%m-%d %H:%M:%S},{65000+i},{65010+i},{64990+i},{65005+i},{0.12345 + i}")
+        path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+        result = load_csv(path, timeframe="1m", timestamp_semantics="bar_open")
+        expect(len(result.bars) == 3, "ожидалось 3 бара")
+        expect(abs(result.bars[0].volume - 0.12345) < 1e-12, f"volume: {result.bars[0].volume}")
+    return "volume=0.12345 загружен без округления"
 
 
 @check("Некорректные CSV дают понятные ошибки (9 негативных кейсов)")
@@ -294,6 +255,12 @@ def check_csv_negative() -> str | None:
             else:
                 raise AssertionError(f"{title}: ошибка НЕ была выброшена")
     return f"{len(cases)} кейсов: дубликат/порядок/OHLC/типы/пустой файл/колонки/объём"
+
+
+def _write_bad_csv(tmp: Path, rows: list[str], header: str = "datetime,open,high,low,close,volume") -> Path:
+    path = tmp / "bad.csv"
+    path.write_text("\n".join([header, *rows]) + "\n", encoding="utf-8")
+    return path
 
 
 @check("Пропуски свечей: warning W_GAP, данные не заполняются молча")
@@ -396,7 +363,8 @@ def check_coverage_gap() -> str | None:
 
 @check("Календарь сессий: интервал через перерыв собирается полностью (без фиктивных баров)")
 def check_sessions_break() -> str | None:
-    calendar = SessionCalendar.from_spec("Europe/Moscow", [(range(0, 7), [("10:00", "10:05"), ("10:10", "10:15")])])
+    # условные окна 07:00-07:05 и 07:10-07:15 UTC; бары только в окнах
+    calendar = SessionCalendar.from_spec("UTC", [(range(0, 7), [("07:00", "07:05"), ("07:10", "07:15")])])
     bars = []
     for minute in list(range(0, 5)) + list(range(10, 15)):
         o = 100.0 + minute
@@ -410,247 +378,102 @@ def check_sessions_break() -> str | None:
                 low=o - 1.0,
                 close=o + 1.0,
                 volume=10 * (minute + 1),
-                symbol="DEMO@DEMO",
+                symbol="DEMO",
             )
         )
     result = resample(bars, "1m", "10m", calendar=calendar)
     complete = [b for b in result.bars if b.ts_open == START]
-    expect(len(complete) == 1, f"интервал 10:00-10:10 должен быть полным: bars={result.bars}")
+    expect(len(complete) == 1, f"интервал 07:00-07:10 должен быть полным: bars={result.bars}")
     expect(
         not any(i.code is ResampleIssueCode.COVERAGE_INCOMPLETE for i in result.issues),
         f"ложная проблема покрытия: {result.issues}",
     )
     expect(result.pending is not None and result.pending.ts_open == START + timedelta(minutes=10), "второй интервал должен быть pending")
-    return "перерыв 10:05-10:10 учтён календарём: 5 слотов = 5 баров -> полный интервал"
+    return "перерыв 07:05-07:10 учтён календарём: 5 слотов = 5 баров -> полный интервал"
 
 
 # ---------------------------------------------------------------------------
-# 4. Finam-адаптер на подменном транспорте (без сети и секретов)
+# 4. Крипторежим: 24/7 и блокировка LIVE
 # ---------------------------------------------------------------------------
 
-@check("Finam: аутентификация по документированному потоку POST /v1/sessions(+details)")
-def check_finam_auth() -> str | None:
-    transport = FakeTransport(responses=auth_pair())
-    client = make_client(transport)
-    details = client.authenticate()
-    expect(details.account_ids == (FAKE_ACCOUNT,), "account_ids не прочитаны")
-    expect(details.readonly is False, "readonly не прочитан")
-    method, url, headers, body = transport.requests[0]
-    expect(method == "POST" and url == "https://api.finam.ru/v1/sessions", f"неверный auth-запрос: {method} {url}")
-    expect(body == {"secret": FAKE_SECRET}, "тело auth-запроса не соответствует документации")
-    expect(FAKE_SECRET not in url, "secret не должен попадать в URL")
-    method2, url2, _, body2 = transport.requests[1]
-    expect(url2.endswith("/v1/sessions/details") and body2 == {"token": FAKE_TOKEN}, "неверный details-запрос")
-    expect(FAKE_ACCOUNT not in repr(details) and FAKE_ACCOUNT not in str(details), "account id утекает в repr/str")
-    return "token->details, secret только в теле, account_ids скрыты из repr/str"
+@check("Календарь 24/7: выходные и полночь — торговое время; сетка непрерывна")
+def check_crypto_24_7() -> str | None:
+    cal = always_on_calendar()
+    saturday = datetime(2024, 1, 6, 23, 59, tzinfo=UTC)
+    sunday_midnight = datetime(2024, 1, 7, 0, 0, tzinfo=UTC)
+    expect(cal.is_trading_time(saturday), "суббота 23:59 не торговое время")
+    expect(cal.is_trading_time(sunday_midnight), "воскресенье 00:00 не торговое время")
+    slots = cal.trading_slots(datetime(2024, 1, 5, tzinfo=UTC), datetime(2024, 1, 8, tzinfo=UTC), "1h")
+    expect(len(slots) == 72, f"ожидалось 72 часовых слотов за 3 суток, получено {len(slots)}")
+    # воскресные бары без пропусков загружаются без warnings
+    with tempfile.TemporaryDirectory() as tmp:
+        rows = ["datetime,open,high,low,close,volume"]
+        base = datetime(2024, 1, 7, 0, 0)  # воскресенье
+        for i in range(90):  # 1.5 часа через полночь не требуется, но покрываем час+
+            ts = base + timedelta(minutes=i)
+            rows.append(f"{ts:%Y-%m-%d %H:%M:%S},{100+i},{101+i},{99+i},{100.5+i},{10}")
+        path = Path(tmp) / "sunday.csv"
+        path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+        result = load_csv(path, timeframe="1m", calendar=cal, timestamp_semantics="bar_open")
+        expect(result.ok and not result.report.warnings, f"warnings: {result.report.summary_text()}")
+    return "суббота/воскресенье/полночь — торговые; 72 слота за 3 суток; воскресный CSV без warnings"
 
 
-@check("Finam: GET bars — путь, timeframe enum, RFC3339 интервал [start, end), Bearer-заголовок")
-def check_finam_bars_request() -> str | None:
-    payload = {
-        "symbol": "SBER@MISX",
-        "bars": [
-            {
-                "timestamp": "2026-10-20T07:00:00Z",
-                "open": {"value": "313.58"},
-                "high": {"value": "314.10"},
-                "low": {"value": "313.01"},
-                "close": {"value": "313.90"},
-                "volume": {"value": "123456"},
-                "is_data_snapshot": False,
-            }
-        ],
-    }
-    transport = FakeTransport(responses=auth_pair() + [json_response(200, payload)])
-    client = make_client(transport)
-    start = datetime(2026, 10, 20, 7, 0, tzinfo=UTC)
-    records = client.fetch_bars("SBER@MISX", "5m", start, start + timedelta(hours=1))
-    expect(len(records) == 1, "бар не разобран")
-    expect(records[0].open == Decimal("313.58"), f"decimal потерян: {records[0].open}")
-    expect(records[0].volume == Decimal("123456"), "volume потерян")
-    method, url, headers, _ = transport.requests[-1]
-    expect(method == "GET" and "/v1/instruments/SBER%40MISX/bars" in url, f"неверный путь: {url}")
-    expect("timeframe=TIME_FRAME_M5" in url, f"нет enum-таймфрейма: {url}")
-    expect("interval.start_time=2026-10-20T07%3A00%3A00Z" in url, f"нет start_time: {url}")
-    expect("interval.end_time=2026-10-20T08%3A00%3A00Z" in url, f"нет end_time: {url}")
-    expect(headers.get("Authorization") == f"Bearer {FAKE_TOKEN}", "нет Bearer access_key")
-    expect(FAKE_SECRET not in url and FAKE_SECRET not in str(headers), "secret утекает в GET-запрос")
-    return "TIME_FRAME_M5, RFC3339 Z, decimal {value} сохранён, Bearer-заголовок"
+@check("Биржевой интерфейс подготовлен и НЕ реализован; LIVE-гейт блокирует заявки")
+def check_exchange_interface_blocked() -> str | None:
+    import importlib.util
 
-
-@check("Finam: 10m отклонён (нет TIME_FRAME_M10) с инструкцией про ресэмплинг")
-def check_finam_10m_unsupported() -> str | None:
-    transport = FakeTransport(responses=auth_pair())
-    client = make_client(transport)
-    client.authenticate()
-    try:
-        client.fetch_bars("SBER@MISX", "10m", START, START + timedelta(hours=1))
-    except UnsupportedTimeframeError as exc:
-        expect("TIME_FRAME_M10" in str(exc) and "ресэмплинг" in str(exc), f"сообщение: {exc}")
-        return "UnsupportedTimeframeError с отсылкой к data.resampler"
-    raise AssertionError("10m НЕ был отклонён")
-
-
-@check("Finam: глубина истории ограничена документированными пределами (M1 7д, M5 30д)")
-def check_finam_depth() -> str | None:
-    transport = FakeTransport(responses=auth_pair())
-    client = make_client(transport)
-    client.authenticate()
-    expect(HISTORY_DEPTH_LIMITS["1m"] == timedelta(days=7), "лимит M1 != 7 дней")
-    expect(HISTORY_DEPTH_LIMITS["5m"] == timedelta(days=30), "лимит M5 != 30 дней")
-    for tf, days in (("1m", 8), ("5m", 31), ("1h", 31)):
-        try:
-            client.fetch_bars("SBER@MISX", tf, START, START + timedelta(days=days))
-        except Exception as exc:
-            expect(type(exc).__name__ == "HistoryDepthError", f"{tf}/{days}д: {type(exc).__name__}")
-        else:
-            raise AssertionError(f"{tf} на {days} дней НЕ отклонён")
-    return "M1>7д, M5>30д, 1h>30д отклоняются до запроса"
-
-
-@check("Finam: снимок стакана и котировки (документированные поля), глубина не гарантируется")
-def check_finam_snapshots() -> str | None:
-    quote_payload = {
-        "symbol": "SBER@MISX",
-        "quote": {
-            "timestamp": "2026-10-20T07:00:01Z",
-            "last": {"value": "313.58"},
-            "bid": {"value": "313.57"},
-            "ask": {"value": "313.59"},
-            "bid_size": {"value": "120"},
-            "ask_size": {"value": "90"},
-            "volume": {"value": "98765"},
-        },
-    }
-    book_payload = {
-        "symbol": "SBER@MISX",
-        "orderbook": {
-            "rows": [
-                {"price": {"value": "313.57"}, "buy_size": {"value": "120"}, "action": "ACTION_UPDATE", "mpid": "MC000"},
-                {"price": {"value": "313.59"}, "sell_size": {"value": "90"}, "action": "ACTION_ADD"},
-            ]
-        },
-    }
-    transport = FakeTransport(responses=auth_pair() + [json_response(200, quote_payload), json_response(200, book_payload)])
-    source = FinamSnapshotSource(make_client(transport))
-    quote = source.get_latest_quote("SBER@MISX")
-    expect(quote.last == Decimal("313.58") and quote.bid_size == Decimal("120"), f"quote: {quote}")
-    book = source.get_order_book("SBER@MISX")
-    expect(book.depth == 2, f"depth: {book.depth}")
-    expect(book.rows[0].side.value == "buy" and book.rows[1].side.value == "sell", "стороны перепутаны")
-    return "quote(last/bid/ask/sizes), orderbook 2 уровня (buy/sell, action, mpid) — только фактическая глубина"
-
-
-@check("Finam: 429 -> ожидание минутного окна и один повтор (не немедленный ретрай)")
-def check_finam_429() -> str | None:
-    sleeps: list[float] = []
-    transport = FakeTransport(
-        responses=auth_pair()
-        + [
-            json_response(429, {"code": 8, "message": "too many requests"}),
-            json_response(200, {"symbol": "SBER@MISX", "bars": []}),
-        ]
+    from tradebot.exchange import (
+        EXCHANGE_INTEGRATION_AVAILABLE,
+        ExchangeAdapter,
+        ExchangeNotImplemented,
+        get_exchange_adapter,
     )
-    client = make_client(transport, sleeps=sleeps)
-    records = client.fetch_bars("SBER@MISX", "5m", START, START + timedelta(hours=1))
-    expect(records == [], "ожидался пустой список баров после успешного повтора")
-    expect(any(s >= 60.0 for s in sleeps), f"не было ожидания окна (~60 c): {sleeps}")
-    return f"повтор после ожидания {sleeps[0]:.0f} c"
+    from tradebot.live.gate import evaluate_live_gate
 
-
-@check("Finam: 400 не повторяется; сообщения ошибок маскируют секреты")
-def check_finam_400_and_masking() -> str | None:
-    body = {"code": 3, "message": f"bad request secret={FAKE_SECRET} token={FAKE_TOKEN}"}
-    transport = FakeTransport(responses=auth_pair() + [json_response(400, body)])
-    client = make_client(transport)
+    expect(EXCHANGE_INTEGRATION_AVAILABLE is False, "интеграция объявлена доступной — это не так")
     try:
-        client.fetch_bars("SBER@MISX", "5m", START, START + timedelta(hours=1))
-    except FinamInvalidRequestError as exc:
-        message = str(exc)
-        expect(FAKE_SECRET not in message, "secret НЕ замаскирован в ошибке")
-        expect(FAKE_TOKEN not in message, "access_key НЕ замаскирован в ошибке")
-        expect("***SECRET_KEY***" in message and "***ACCESS_KEY***" in message, f"маскирование: {message}")
+        get_exchange_adapter("anything")
+    except ExchangeNotImplemented:
+        pass
     else:
-        raise AssertionError("400 не вызвал FinamInvalidRequestError")
-    gets = [r for r in transport.requests if r[0] == "GET" and "/bars" in r[1]]
-    expect(len(gets) == 1, f"400 повторялся {len(gets)} раз — должен без повторов")
-    return "один запрос, secret/token заменены на ***"
+        raise AssertionError("get_exchange_adapter НЕ выбросил ExchangeNotImplemented")
+    expect(issubclass(ExchangeAdapter, object) and hasattr(ExchangeAdapter, "gateway"),
+           "контракт адаптера неполный")
+    # прежний брокерский пакет удалён (имя собрано из фрагментов — см. гигиену)
+    expect(importlib.util.find_spec("tradebot.fi" + "nam") is None, "модуль прежней интеграции всё ещё импортируем")
 
-
-@check("Finam: нормализация баров требует ЯВНОЙ семантики timestamp (research Q3)")
-def check_finam_semantics_explicit() -> str | None:
-    ts_payload = {
-        "symbol": "SBER@MISX",
-        "bars": [
-            {
-                "timestamp": "2026-10-20T07:05:00Z",
-                "open": {"value": "100"},
-                "high": {"value": "101"},
-                "low": {"value": "99"},
-                "close": {"value": "100.5"},
-                "volume": {"value": "10"},
-                "is_data_snapshot": False,
-            }
-        ],
+    # LIVE-гейт: даже «полное включение» не открывает ордерный контур
+    config = {
+        "run": {"mode": "LIVE", "experiment_id": "gate-check"},
+        "data": {"csv_dir": "data/demo",
+                 "symbols": [{"ticker": "BTCUSDT", "files": {}}],
+                 "timestamp_semantics": "bar_open", "source_timezone": "UTC"},
+        "timeframes": {"5m": {"enabled": True, "lookback_bars": 10, "horizon_bars": 1}},
+        "risk": {"initial_capital_quote": 100_000.0, "position_units": 1, "max_position_units": 10,
+                 "max_orders_per_day": 5, "daily_loss_limit_quote": 1_000.0,
+                 "max_drawdown_pct": 10.0, "max_data_age_seconds": 60.0},
+        "instrument": {"price_step": 0.01, "lot_size_units": 1},
+        "simulation": {"commission_bps": 3.0, "slippage_bps": 2.0},
+        "live": {"allow_orders": True, "max_order_quantity_units": 1,
+                 "kill_switch_file": "no-such-file.kill"},
     }
-    try:
-        FinamHistorySource(make_client(FakeTransport(responses=auth_pair())), bar_timestamp_semantics=None)
-    except ValueError as exc:
-        expect("bar_timestamp_semantics" in str(exc), f"сообщение: {exc}")
-    else:
-        raise AssertionError("None-семантика принята — молчаливое угадывание запрещено")
-    for semantics, expected in (
-        ("bar_open", datetime(2026, 10, 20, 7, 5, tzinfo=UTC)),
-        ("bar_close", datetime(2026, 10, 20, 7, 0, tzinfo=UTC)),
-    ):
-        transport = FakeTransport(responses=auth_pair() + [json_response(200, ts_payload)])
-        source = FinamHistorySource(make_client(transport), bar_timestamp_semantics=semantics)
-        bars = source.fetch_history("SBER@MISX", "5m", datetime(2026, 10, 20, tzinfo=UTC), datetime(2026, 10, 21, tzinfo=UTC))
-        expect(bars[0].ts_open == expected, f"{semantics}: {bars[0].ts_open} != {expected}")
-        expect(bars[0].volume == 10 and isinstance(bars[0].volume, int), "volume не int")
-    return "None -> ValueError; bar_open/bar_close нормализуются корректно"
+    from tradebot.config import AppConfig
 
-
-@check("Finam: naive-timestamp и дробный volume отклоняются (данные не угадываются)")
-def check_finam_strict_parsing() -> str | None:
-    naive = {
-        "symbol": "SBER@MISX",
-        "bars": [
-            {"timestamp": "2026-10-20T07:05:00", "open": {"value": "1"}, "high": {"value": "2"},
-             "low": {"value": "0.5"}, "close": {"value": "1.5"}, "volume": {"value": "10"}}
-        ],
-    }
-    transport = FakeTransport(responses=auth_pair() + [json_response(200, naive)])
-    source = FinamHistorySource(make_client(transport), bar_timestamp_semantics="bar_open")
-    try:
-        source.fetch_history("SBER@MISX", "5m", START, START + timedelta(hours=1))
-    except Exception as exc:
-        expect(type(exc).__name__ == "FinamInvalidResponseError", f"naive ts: {type(exc).__name__}")
-    else:
-        raise AssertionError("naive timestamp принят")
-    fractional = {
-        "symbol": "SBER@MISX",
-        "bars": [
-            {"timestamp": "2026-10-20T07:00:00Z", "open": {"value": "1"}, "high": {"value": "2"},
-             "low": {"value": "0.5"}, "close": {"value": "1.5"}, "volume": {"value": "10.5"}}
-        ],
-    }
-    transport2 = FakeTransport(responses=auth_pair() + [json_response(200, fractional)])
-    source2 = FinamHistorySource(make_client(transport2), bar_timestamp_semantics="bar_open")
-    try:
-        source2.fetch_history("SBER@MISX", "1m", START, START + timedelta(minutes=30))
-    except Exception as exc:
-        expect(type(exc).__name__ == "FinamInvalidResponseError", f"fractional volume: {type(exc).__name__}")
-    else:
-        raise AssertionError("дробный volume принят (округление молча запрещено)")
-    return "naive ts и volume=10.5 отклонены как FinamInvalidResponseError"
+    app = AppConfig.model_validate(config)
+    result = evaluate_live_gate(app, cli_flag=True, env={"TRADEBOT_LIVE_ACK": "ENABLE-LIVE"},
+                                kill_switch_exists=False)
+    expect(not result.allowed, "гейт разрешил LIVE без биржевой интеграции!")
+    expect(any("НЕ реализована" in f for f in result.failures), f"нет причины про биржу: {result.failures}")
+    expect("exchange_integration" in result.checks_performed, "фактор биржи не проверяется гейтом")
+    return "адаптер бросает ExchangeNotImplemented; гейт: allowed=False, причина — интеграция не реализована"
 
 
 # ---------------------------------------------------------------------------
 # 5. Гигиена
 # ---------------------------------------------------------------------------
 
-@check("Гигиена: .gitignore/.env.example; в коде нет торговых операций и секретов")
+@check("Гигиена: .gitignore/.env.example; в коде нет торговых операций и следов прежней интеграции")
 def check_hygiene() -> str | None:
     gitignore = (REPO_ROOT / ".gitignore").read_text(encoding="utf-8")
     expect(".env" in gitignore, ".gitignore не покрывает .env")
@@ -658,11 +481,11 @@ def check_hygiene() -> str | None:
     expect("REPLACE_WITH_YOUR_OWN" in example, ".env.example без фиктивных заглушек")
     expect("eyJ" not in example, ".env.example содержит JWT-подобное значение")
     # токены собраны из фрагментов, чтобы проверка не обнаруживала саму себя.
-    # ФАЗА 5: торговые операции разрешены ТОЛЬКО в отдельном ордерном адаптере
-    # src/tradebot/finam/broker.py (за многофакторным LIVE-гейтом, docs/live.md) —
-    # файл в явном allowlist; остальные модули по-прежнему «без торговли».
+    # Торговые операции в проекте отсутствуют: подключение биржи не реализовано
+    # (exchange/base.py) — allowlist пуст.
     forbidden = ["/or" + "ders", "Place" + "Order", "Cancel" + "Order", "sltp-" + "orders", "new_" + "order"]
-    allowed_files = {"broker.py"}
+    legacy = ["fi" + "nam", "MO" + "EX", "MI" + "SX"]
+    allowed_files: set[str] = set()
     offenders = []
     for pattern in ("src/**/*.py", "scripts/**/*.py", "configs/*.yaml"):
         for path in REPO_ROOT.glob(pattern):
@@ -670,15 +493,16 @@ def check_hygiene() -> str | None:
                 continue
             text = path.read_text(encoding="utf-8", errors="replace")
             offenders.extend(f"{path.name}:{tok}" for tok in forbidden if tok in text)
-    expect(not offenders, f"упоминания торговых операций: {offenders}")
+            offenders.extend(f"{path.name}:{tok}" for tok in legacy if tok.lower() in text.lower())
+    expect(not offenders, f"запрещённые токены: {offenders}")
     import os
 
-    real = os.environ.get("TRADE_API_SECRET", "").strip()
+    real = os.environ.get("EXCHANGE_API_SECRET", "").strip()
     if real:
         for pattern in ("src/**/*.py", "scripts/**/*.py", "configs/*.yaml"):
             for path in REPO_ROOT.glob(pattern):
                 expect(real not in path.read_text(encoding="utf-8", errors="replace"), f"реальный секрет в {path}")
-    return "секреты/торговые операции отсутствуют; .env исключён из git"
+    return "секреты/торговые операции/следы прежней интеграции отсутствуют; .env исключён из git"
 
 
 # ---------------------------------------------------------------------------
@@ -688,12 +512,12 @@ def check_hygiene() -> str | None:
 def main() -> int:
     import logging
 
-    # Детерминированный вывод сценария: предупреждения логгеров (например ожидание
-    # окна после фиктивного 429) не должны смешиваться с протоколом проверок.
+    # Детерминированный вывод сценария: предупреждения логгеров не должны
+    # смешиваться с протоколом проверок.
     logging.disable(logging.CRITICAL)
     print("=" * 78)
-    print("РУЧНАЯ ПРОВЕРКА ФАЗЫ 0-2: конфиг, CSV, агрегация ТФ, read-only Finam-адаптер")
-    print("Режим: ЛОКАЛЬНЫЙ (без сети и секретов; Finam — подменный транспорт)")
+    print("РУЧНАЯ ПРОВЕРКА СЛОЯ ДАННЫХ (КРИПТОРЕЖИМ): конфиг, CSV, агрегация ТФ, 24/7")
+    print("Режим: ЛОКАЛЬНЫЙ (без сети и секретов)")
     print("Демо-данные: СИНТЕТИЧЕСКИЕ (data/demo/DEMO_M1.csv), ожидаемые значения — ручной расчёт")
     print("=" * 78)
     failures = 0
@@ -720,10 +544,8 @@ def main() -> int:
         return 1
     print(f"RESULT: PASS ({total}/{total} checks)")
     print()
-    print("Необязательная проверка РЕАЛЬНОГО API (потребует ВАШИ учётные данные,")
-    print("автоматически не запускается; только read-only, заявки не выставляются):")
-    print('  $env:TRADE_API_SECRET = "<ваш secret_key>"')
-    print("  python -m tradebot.cli.smoke_readonly --symbol SBER@MISX --timeframe 5m --hours 24 --bar-timestamp-semantics bar_open")
+    print("Дополнительно (офлайн, на демо-данных):")
+    print("  python -m tradebot.cli.validate_data --config configs\\demo.yaml --resample 10m")
     return 0
 
 

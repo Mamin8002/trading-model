@@ -1,22 +1,23 @@
-# ДЕМО-конфигурация для офлайн-проверок на СИНТЕТИЧЕСКИХ данных.
+# ДЕМО-конфигурация для офлайн-проверок на СИНТЕТИЧЕСКИХ данных (крипторежим).
 # ВАЖНО: data/demo/DEMO_M1.csv — искусственные демонстрационные данные
-# (детерминированный шаблон цены/объёма), НЕ реальные рыночные данные.
-# Символ DEMO@DEMO выбран намеренно, чтобы не путать с реальным инструментом.
+# (детерминированный шаблон цены/объёма, 10080 минутных баров = 7 суток
+# 2024-01-03 18:00 — 2024-01-10 17:59 UTC, серия непрерывная, проходит через
+# полночи и выходные), НЕ реальные рыночные данные.
+# Символ DEMO выбран намеренно, чтобы не путать с реальной торговой парой.
 
 run:
   mode: TEST
-  experiment_id: demo-phase02
+  experiment_id: demo-crypto
 
 data:
   csv_dir: data/demo
   symbols:
-    - ticker: DEMO
-      mic: DEMO
+    - ticker: DEMO            # символ пары (формат биржи; для демо — условный)
       files:
         "1m": DEMO_M1.csv
   timestamp_semantics: bar_open   # демо-файл сгенерирован с меткой начала бара
-  source_timezone: Europe/Moscow
-  volume_units: pieces
+  source_timezone: UTC            # соглашение крипторынка: метки CSV в UTC (docs/data.md §2)
+  volume_units: base_asset        # объём в единицах базового актива (демо — условные единицы)
 
 timeframes:
   "5m":
@@ -25,7 +26,7 @@ timeframes:
     horizon_bars: 2
   "10m":
     enabled: true
-    base_timeframe: "5m"  # 10m строится ресэмплингом (в Finam API нет M10)
+    base_timeframe: "5m"  # 10m строится локальным ресэмплингом из 5m (decisions D3)
     lookback_bars: 6
     horizon_bars: 1
   "15m":
@@ -37,19 +38,17 @@ timeframes:
     lookback_bars: 1
     horizon_bars: 1
 
-# Демо-данные покрывают четверг 2024-01-04 10:00–12:00 MSK; окно сессии подобрано
-# под этот диапазон, чтобы валидатор не выдавал W_OUT_OF_SESSION на демо-данных.
+# Крипторынок работает круглосуточно: календарь 24/7 (окно 00:00-24:00 UTC во все
+# дни недели). Демо-серия непрерывна, поэтому валидатор не выдаёт W_GAP/
+# W_OUT_OF_SESSION. Альтернатива — вообще не задавать sessions (пропуски
+# считаются по равномерной сетке).
 sessions:
-  timezone: Europe/Moscow
+  timezone: UTC
   days:
-    - days: [3]                # только четверг — день демо-данных
+    - days: [0, 1, 2, 3, 4, 5, 6]
       sessions:
-        - { start: "10:00", end: "12:00" }
+        - { start: "00:00", end: "24:00" }
 
 validation:
   max_reported_issues: 50
   warn_zero_volume: true
-
-finam:
-  base_url: https://api.finam.ru
-  bar_timestamp_semantics: null   # для демо не используется (сеть не требуется)

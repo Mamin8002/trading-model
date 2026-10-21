@@ -10,8 +10,9 @@
 - OHLC: open = close предыдущего бара × (1 + маленький гэп); high/low достраиваются
   вокруг тела так, чтобы инварианты low <= open/close <= high выполнялись строго;
 - volume: базовый уровень × (1 + k·|r|) × логнормальный шум, целые штуки;
-- временные метки: минутная сетка, только пн-пт, окно 08:00-16:00 UTC
-  (условная «сессия»; календарь демо-режима, не расписание MOEX).
+- временные метки: минутная сетка; по умолчанию условное демо-окно пн-пт
+  08:00-16:00 UTC (для тестов пропусков/сессий), а при ``continuous=True`` —
+  непрерывная сетка 24/7 без выходных (режим крипторынка, docs/data.md).
 """
 
 from __future__ import annotations
@@ -25,17 +26,30 @@ from .bar import UTC, Bar, BarSource, Timeframe
 __all__ = ["generate_synthetic_bars", "trading_minute_grid"]
 
 
-def trading_minute_grid(start: datetime, count: int, step_minutes: int = 1) -> list[datetime]:
-    """Минутная сетка пн-пт 08:00-15:59 UTC (окно [08:00, 16:00)).
+def trading_minute_grid(
+    start: datetime, count: int, step_minutes: int = 1, *, continuous: bool = False
+) -> list[datetime]:
+    """Минутная сетка для демо-данных.
 
-    Бары ставятся на слоты, кратные step_minutes от 08:00, начиная с первого слота
-    не раньше start. Это условный демо-календарь (не расписание MOEX).
+    По умолчанию: пн-пт, окно [08:00, 16:00) UTC — условный демо-календарь для
+    тестов пропусков/сессий. При ``continuous=True``: непрерывная сетка 24/7
+    (крипторынок работает круглосуточно) — слоты, кратные step_minutes от полуночи
+    UTC, начиная с первого слота не раньше start.
     """
     if start.tzinfo is None:
         raise ValueError("start должен быть timezone-aware")
     if step_minutes < 1 or 60 % step_minutes != 0:
         raise ValueError("step_minutes должен делить 60 (1, 2, 3, 4, 5, 6, 10, ...)")
     start_utc = start.astimezone(UTC)
+    if continuous:
+        step = timedelta(minutes=step_minutes)
+        slot = start_utc.replace(second=0, microsecond=0)
+        # выравниваем вниз/вверх до кратности step_minutes от полуночи UTC
+        minutes_of_day = slot.hour * 60 + slot.minute
+        remainder = minutes_of_day % step_minutes
+        if remainder:
+            slot += timedelta(minutes=step_minutes - remainder)
+        return [slot + step * i for i in range(count)]
     slots_per_day = (8 * 60) // step_minutes  # окно 8 часов
     slots: list[datetime] = []
     day = start_utc.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -63,19 +77,24 @@ def generate_synthetic_bars(
     seed: int = 12345,
     start: datetime | None = None,
     timeframe: "Timeframe | str" = "5m",
-    symbol: str = "SYNTH@DEMO",
+    symbol: str = "SYNTH-USDT",
     start_price: float = 100.0,
     regime_len: int = 500,
+    continuous: bool = False,
 ) -> list[Bar]:
-    """Детерминированные синтетические OHLCV-бары (см. предупреждение в docstring модуля)."""
+    """Детерминированные синтетические OHLCV-бары (см. предупреждение в docstring модуля).
+
+    ``continuous=True`` — круглосуточная сетка 24/7 (крипторежим);
+    по умолчанию — условное демо-окно пн-пт 08:00-16:00 UTC.
+    """
     tf = Timeframe.parse(timeframe)
     if n_bars < 10:
         raise ValueError("n_bars должен быть >= 10")
     if start is None:
-        start = datetime(2024, 1, 1, 8, 0, tzinfo=UTC)
+        start = datetime(2024, 1, 1, 8, 0, tzinfo=UTC) if not continuous else datetime(2024, 1, 1, 0, 0, tzinfo=UTC)
     rng = np.random.RandomState(seed)
 
-    timestamps = trading_minute_grid(start, n_bars, step_minutes=tf.minutes)
+    timestamps = trading_minute_grid(start, n_bars, step_minutes=tf.minutes, continuous=continuous)
 
     # режимы дрейфа и AR(1)-волатильность
     n_regimes = max(1, n_bars // regime_len + 1)
