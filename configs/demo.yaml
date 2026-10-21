@@ -1,0 +1,55 @@
+# ДЕМО-конфигурация для офлайн-проверок на СИНТЕТИЧЕСКИХ данных.
+# ВАЖНО: data/demo/DEMO_M1.csv — искусственные демонстрационные данные
+# (детерминированный шаблон цены/объёма), НЕ реальные рыночные данные.
+# Символ DEMO@DEMO выбран намеренно, чтобы не путать с реальным инструментом.
+
+run:
+  mode: TEST
+  experiment_id: demo-phase02
+
+data:
+  csv_dir: data/demo
+  symbols:
+    - ticker: DEMO
+      mic: DEMO
+      files:
+        "1m": DEMO_M1.csv
+  timestamp_semantics: bar_open   # демо-файл сгенерирован с меткой начала бара
+  source_timezone: Europe/Moscow
+  volume_units: pieces
+
+timeframes:
+  "5m":
+    enabled: true
+    lookback_bars: 12    # демо-значения: 120 минутных баров = 24 пятиминутных
+    horizon_bars: 2
+  "10m":
+    enabled: true
+    base_timeframe: "5m"  # 10m строится ресэмплингом (в Finam API нет M10)
+    lookback_bars: 6
+    horizon_bars: 1
+  "15m":
+    enabled: true
+    lookback_bars: 4
+    horizon_bars: 1
+  "1h":
+    enabled: true
+    lookback_bars: 1
+    horizon_bars: 1
+
+# Демо-данные покрывают четверг 2024-01-04 10:00–12:00 MSK; окно сессии подобрано
+# под этот диапазон, чтобы валидатор не выдавал W_OUT_OF_SESSION на демо-данных.
+sessions:
+  timezone: Europe/Moscow
+  days:
+    - days: [3]                # только четверг — день демо-данных
+      sessions:
+        - { start: "10:00", end: "12:00" }
+
+validation:
+  max_reported_issues: 50
+  warn_zero_volume: true
+
+finam:
+  base_url: https://api.finam.ru
+  bar_timestamp_semantics: null   # для демо не используется (сеть не требуется)

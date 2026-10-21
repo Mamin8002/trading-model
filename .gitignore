@@ -1,0 +1,41 @@
+# Секреты — никогда не коммитить (docs/research.md S3b, S4)
+.env
+.env.*
+!.env.example
+*.secret
+secrets.*
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# Артефакты данных и отчёты (демо-данные — исключение, они синтетические и помечены)
+data/*
+!data/demo/
+reports/
+models/
+
+# Инструменты
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ОС/IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Аварийный выключатель LIVE-контура (architecture §7)
+.kill
+
+# Служебный кэш загруженных источников исследования (не часть поставки)
+.research/

@@ -1,1 +1,124 @@
-# trading-model
+# tradebot — торговый бот для данных Московской биржи (каркас + данные + ML-контур)
+
+Проект: бот с режимами **TEST** (обучение/симуляция на исторических CSV) и **LIVE**
+(Finam Trade API), свечи OHLCV, таймфреймы **1m / 5m / 10m / 15m / 1h**, табличные
+признаки и градиентный бустинг (LightGBM).
+
+Проектные документы (читать в этом порядке):
+
+1. [docs/research.md](docs/research.md) — исследование Finam Trade API и референсного
+   проекта WISEPLAT: подтверждённые факты, версии, открытые вопросы Q1–Q9;
+2. [docs/architecture.md](docs/architecture.md) — модули, контракт данных, конфиг, TEST/LIVE;
+3. [docs/decisions.md](docs/decisions.md) — решения D1–D15 с аргументами;
+4. [docs/roadmap.md](docs/roadmap.md) — этапы и критерии приёмки;
+5. [docs/data.md](docs/data.md) — формат CSV, время/таймзоны, агрегация таймфреймов,
+   запуск проверок данных;
+6. [docs/ml.md](docs/ml.md) — **признаки, целевая переменная, walk-forward, метрики,
+   артефакты модели, команды обучения** (операционный документ фазы 3).
+
+## Что реализовано
+
+Фаза 0-2 (каркас и данные):
+- конфигурация: YAML + строгая pydantic-схема; per-timeframe `lookback_bars` и
+  `horizon_bars` — обязательные явные значения; хэш конфига для артефактов;
+- данные: загрузчик и валидатор CSV `datetime,open,high,low,close,volume`
+  (схема/типы/порядок/дубликаты/OHLC/пропуски/сетка/сессии), нормализация времени
+  (таймзона → UTC, `bar_open|bar_close` → `bar_open`);
+- ресэмплинг 1m/5m → 5m/10m/15m/1h: неполные интервалы никогда не выдаются за полные
+  (pending отдельно, пропуски не заполняются);
+- календарь торговых сессий (конфигурируемый, без хардкода биржевых правил);
+- read-only адаптер Finam Trade API (REST, только документированные методы),
+  документированная политика повторов/лимитов, маскирование секретов;
+- интерфейсы источников данных (`HistorySource`, `QuoteSnapshotSource`,
+  `OrderBookSnapshotSource`, `StreamSource`-контракт) — граница TEST/LIVE;
+- CLI: `validate_data` (офлайн), `smoke_readonly` (необязательная проверка
+  подключения с ВАШИМИ учётными данными).
+
+Фаза 3 (ML-контур, [docs/ml.md](docs/ml.md)):
+- 31 причинный признак v1 (доходности, EMA, RSI, MACD, ATR, диапазон свечи,
+  волатильность, объём, внутридневное время) с настраиваемыми периодами; тесты
+  причинности (префикс-инвариантность + возмущение будущего);
+- целевая переменная: forward-return через H баров с нейтральной полосой
+  (классификация) или регрессия; будущие значения изолированы в `labels/`;
+- LightGBM (детерминированный режим, seed) + базовые ориентиры majority /
+  momentum / logreg на тех же фолдах (decisions D4);
+- purged walk-forward с embargo ≥ горизонта: хронологические окна, очистка
+  перекрывающихся целевых горизонтов, early stopping только внутри train-окна,
+  явная ошибка при недостатке истории; аудит «random-split vs walk-forward»;
+- метрики ML по фолдам и OOS; торговые метрики после комиссий/слиппеджа
+  (net, maxDD, turnover, сделки, hit-rate, PF, Sharpe/CAGR) с явными допущениями
+  годового пересчёта;
+- реестр моделей: артефакт + метаданные (период, ТФ, горизонт, признаки,
+  параметры, версии библиотек, результаты) + проверка совместимости при загрузке;
+- markdown-отчёт с допущениями, сравнением с ориентирами и вердиктом по
+  заранее заданным порогам (без утверждений о прибыльности);
+- CLI: `python -m tradebot.cli.train`.
+
+**Не реализовано (осознанно):** выставление заявок (запрещено текущими фазами),
+полный событийный бэктест-симулятор (этап B1), потоковые подписки LIVE (этап L2),
+LIVE-оркестратор и исполнение, CatBoost-кандидат (P1).
+
+## Установка и проверка (PowerShell)
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -e ".[dev,ml]"
+
+# ручная проверка фазы 0-2 (данные; без сети и секретов) — ожидает RESULT: PASS (24/24)
+python scripts\manual_checks\check_phase_02_data.py
+
+# ручная проверка фазы 3 (ML; синтетические данные, без сети) — ожидает RESULT: PASS (15/15)
+python scripts\manual_checks\check_phase_03_ml.py
+
+# юнит-тесты
+python -m pytest -q
+
+# офлайн-валидация демо-данных и агрегации
+python -m tradebot.cli.validate_data --config configs\demo.yaml --resample 10m
+
+# обучение на своих данных (заполните configs\ml_example.yaml)
+python -m tradebot.cli.train --config configs\ml_example.yaml --timeframe 5m
+```
+
+Необязательная read-only проверка реального Finam API (потребует ваш secret_key;
+автоматически не запускается) — см. [docs/data.md](docs/data.md), раздел 6.
+
+## Безопасность
+
+- секреты (`TRADE_API_SECRET`, `FINAM_ACCOUNT_ID`) — только переменные окружения или
+  файл `.env`, который исключён из Git; `.env.example` содержит лишь имена переменных
+  и фиктивные заглушки;
+- идентификаторы счетов не печатаются в логах/отчётах; secret_key и access_key
+  маскируются в сообщениях об ошибках;
+- торговые операции в коде отсутствуют; гигиена-тесты блокируют их появление;
+- демо-данные `data/demo/` — синтетические и явно помечены как такие.
+
+## Структура
+
+```
+src/tradebot/
+├── config/      # схема (pydantic), загрузка YAML, хэш, секреты из env
+├── data/        # Bar/Timeframe, CSV loader+validator, sessions, resampler, synthetic (демо)
+├── features/    # причинные индикаторы v1, FeatureSpec/манифест, FeatureBuilder
+├── labels/      # целевая переменная (forward-return, нейтральная полоса)
+├── ml/          # датасет, purged walk-forward, базовые ориентиры, метрики, обучение, реестр, отчёт
+├── marketdata/  # интерфейсы источников данных + CsvHistorySource (TEST)
+├── finam/       # read-only REST-адаптер: transport, ratelimit, errors, client, source
+└── cli/         # validate_data (офлайн), train (офлайн), smoke_readonly (с учётными данными)
+configs/         # example.yaml, demo.yaml, ml_example.yaml
+data/demo/       # СИНТЕТИЧЕСКИЕ демонстрационные CSV
+scripts/manual_checks/  # ручные проверки фаз 0-2 и 3
+tests/           # юнит-тесты (Finam — только на подменном транспорте)
+docs/            # проектные документы
+models/, reports/ # артефакты обучения (исключены из git)
+```
+
+Python ≥ 3.10 (целевая 3.11). Ядро: `pydantic`, `PyYAML`, `tzdata` (Windows);
+extra `ml`: `numpy`, `pandas`, `lightgbm>=4,<5`, `scikit-learn`, `pyarrow`;
+dev: `pytest`. Обоснование — в [pyproject.toml](pyproject.toml), architecture §8
+и [docs/ml.md](docs/ml.md) §1.
+
+Статус: исследовательский контур. Не production-ready; доходность не обещается
+(docs/decisions.md D15).
