@@ -152,8 +152,11 @@ class TestRepoHygiene:
             yield from Path(".").glob(pattern)
 
     def test_no_order_endpoints_in_code(self):
-        # торговые операции не реализованы: соответствующих путей/имён в коде нет.
-        # Токены собраны из фрагментов, чтобы этот тест не обнаруживал сам себя.
+        # Торговые операции разрешены ТОЛЬКО в отдельном ордерном адаптере
+        # src/tradebot/finam/broker.py (фаза 5, за многофакторным LIVE-гейтом,
+        # docs/live.md) и в его тестах — эти файлы в явном allowlist.
+        # Все остальные модули (data/ml/backtest/strategy/execution/cli/live) —
+        # по-прежнему «без торговли»: появление торговых вызовов там блокируется.
         forbidden = [
             "/or" + "ders",
             "Place" + "Order",
@@ -161,15 +164,23 @@ class TestRepoHygiene:
             "sltp-" + "orders",
             "new_" + "order",
         ]
+        allowed_files = {
+            "test_env_cli.py",
+            "broker.py",
+            "test_broker_adapter.py",
+            "test_live_gate.py",
+            "test_integration_pipeline.py",
+            "check_phase_05_test_run.py",
+        }
         offenders = []
         for path in self._iter_repo_files():
-            if path.name in {"test_env_cli.py"}:
+            if path.name in allowed_files:
                 continue
             text = path.read_text(encoding="utf-8", errors="replace")
             for token in forbidden:
                 if token in text:
                     offenders.append(f"{path}: {token}")
-        assert offenders == [], f"Найдены упоминания торговых операций: {offenders}"
+        assert offenders == [], f"Найдены упоминания торговых операций вне allowlist: {offenders}"
 
     def test_env_example_has_only_placeholders(self):
         text = Path(".env.example").read_text(encoding="utf-8")

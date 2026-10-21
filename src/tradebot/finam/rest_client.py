@@ -11,12 +11,14 @@
 - GET  /v1/assets/{symbol}               — метаданные инструмента;
 - GET  /v1/assets/{symbol}/params        — торговые параметры (нужен account_id).
 
-НЕ реализовано в этой фазе (осознанно, без угадывания):
+НЕ реализовано в самом клиенте (осознанно, без угадывания):
 - Clock/Schedule/Usage/Exchanges/AllAssets — пути подтверждены swagger-ом, но схемы
   ответов здесь не проверялись; будут добавлены на этапе L1 roadmap после сверки
   с документацией (research: «не угадывать детали API»);
-- любые операции выставления/отмены заявок — запрещены задачей этой фазы
-  (read-only клиент физически не содержит торговых методов);
+- торговая семантика (выставление/отмена заявок) в этом клиенте ОТСУТСТВУЕТ:
+  клиент предоставляет только общий документированный транспорт ``request_json``;
+  ордерный адаптер — отдельный модуль ``finam/broker.py`` (фаза 5), доступный
+  исключительно за многофакторным LIVE-гейтом (docs/live.md);
 - потоковые подписки (WS/gRPC) — контракт определён в marketdata.interfaces.StreamSource,
   реализация на этапе L2 (decisions D7).
 
@@ -484,6 +486,36 @@ class FinamRestClient:
         self._token = None
         self._token_details = None
 
+    # ------------------------------------------------------- общий транспорт
+
+    def request_json(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, str] | None = None,
+        body: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Общий документированный запрос-ответ (GET/POST/DELETE) с аутентификацией.
+
+        Семантика повторов:
+        - GET: по документированной таблице (транспорт/5xx — backoff+jitter;
+          429 — ожидание окна и один повтор; 401 — один перевыпуск токена);
+        - POST/DELETE: БЕЗ автоповторов (потерянный ответ = «неизвестный результат»,
+          обработка — на стороне вызывающего адаптера, research §2.8).
+
+        Метод не содержит торговой семантики: состав запросов и защита от
+        дублирования — ответственность вызывающего (finam/broker.py за LIVE-гейтом).
+        """
+        normalized = method.upper()
+        if normalized == "GET":
+            return self._get_json(path, params)
+        if normalized == "POST":
+            return self._post_json(path, body or {}, auth=True)
+        if normalized == "DELETE":
+            return self._delete_json(path)
+        raise ValueError(f"Неподдерживаемый HTTP-метод: {method!r}")
+
     def _headers(self, auth: bool) -> dict[str, str]:
         headers = {"Accept": "application/json"}
         if auth:
@@ -582,6 +614,31 @@ class FinamRestClient:
             self._error_message(response, f"HTTP {response.status}"), status_code=response.status
         )
 
+    def _delete_json(self, path: str) -> dict[str, Any]:
+        """DELETE без автоповторов: потерянный ответ отмены требует сверки состояния
+        заявки вызывающим кодом (research §2.8: «сначала запросить текущее состояние»)."""
+        url = self._base_url + path
+        method_key = f"DELETE {_path_template(path)}"
+        self._limiter.acquire(method_key)
+        headers = self._headers(auth=True)
+        try:
+            response = self._transport.request(method="DELETE", url=url, headers=headers, timeout=self._timeout)
+        except FinamTransportError:
+            logger.warning("%s: транспортная ошибка — результат НЕИЗВЕСТЕН, требуется сверка состояния", method_key)
+            raise
+        logger.info("%s -> %d", method_key, response.status)
+        if response.status == 200:
+            return self._parse_json_body(response)
+        if response.status == 401:
+            raise FinamAuthError(self._error_message(response, "401 при отмене"))
+        if response.status == 404:
+            raise FinamNotFoundError(self._error_message(response, "заявка/счёт не найдены при отмене"))
+        if response.status == 429:
+            raise FinamRateLimitError(self._error_message(response, "лимит запросов исчерпан при отмене"))
+        if response.status == 400:
+            raise FinamInvalidRequestError(self._error_message(response, "неверный запрос отмены"))
+        raise FinamServerError(self._error_message(response, f"HTTP {response.status}"), status_code=response.status)
+
     def _parse_json_body(self, response: HttpResponse) -> dict[str, Any]:
         try:
             payload = response.json()
@@ -621,10 +678,19 @@ def _enc(symbol: str) -> str:
 
 
 def _path_template(path: str) -> str:
-    """Ключ лимитера/логов — шаблон пути без конкретных значений (research S3j Рецепт 8)."""
+    """Ключ лимитера/логов — шаблон пути без конкретных значений (research S3j Рецепт 8).
+
+    Маскируются: символы (ticker@mic), идентификаторы счетов (чувствительные данные —
+    в логах не печатаются) и идентификаторы заявок.
+    """
     parts = path.split("/")
     for i, part in enumerate(parts):
-        if "@" in part or urllib.parse.quote(part, safe="") != part:
+        prev = parts[i - 1] if i > 0 else ""
+        if prev == "accounts":
+            parts[i] = "{account_id}"
+        elif prev == "orders" and part:
+            parts[i] = "{order_id}"
+        elif "@" in part or urllib.parse.quote(part, safe="") != part:
             parts[i] = "{symbol}"
     return "/".join(parts)
 

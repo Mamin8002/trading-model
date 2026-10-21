@@ -14,7 +14,12 @@
 5. [docs/data.md](docs/data.md) — формат CSV, время/таймзоны, агрегация таймфреймов,
    запуск проверок данных;
 6. [docs/ml.md](docs/ml.md) — **признаки, целевая переменная, walk-forward, метрики,
-   артефакты модели, команды обучения** (операционный документ фазы 3).
+   артефакты модели, команды обучения** (операционный документ фазы 3);
+7. [docs/simulation.md](docs/simulation.md) — риск-контроль, TEST-симулятор, журнал (фаза 4);
+8. [docs/user_guide.md](docs/user_guide.md) — **пошаговое руководство: установка, CSV,
+   обучение, отчёт walk-forward, TEST-запуск единой командой, секреты** (фаза 5);
+9. [docs/live.md](docs/live.md) — **граница LIVE: статусы компонентов, многофакторный
+   гейт, ордерный адаптер, чек-лист до реального LIVE** (фаза 5).
 
 ## Что реализовано
 
@@ -81,10 +86,38 @@
   детерминированные сценарии (`ScriptedSignalSource`);
 - CLI: `python -m tradebot.cli.simulate` (офлайн: CSV + артефакт модели).
 
-**Не реализовано (осознанно):** выставление реальных заявок и имитация
-подтверждений брокера (запрещено текущими фазами), LIVE-шлюз и reconciliation с
-брокером (этап L3), потоковые подписки LIVE (этап L2), частичные исполнения и
-ликвидность стакана, шорты/маржа, мультисимвольный портфель, CatBoost-кандидат (P1).
+Фаза 5 (интеграция и граница LIVE, [docs/user_guide.md](docs/user_guide.md),
+[docs/live.md](docs/live.md)):
+- единая точка запуска `python -m tradebot test` — полный TEST-путь одной
+  командой: CSV → (обучение ИЛИ готовый артефакт) → сигналы → риск-контроль →
+  симулятор → результаты + отчёт + журнал; коды возврата 0/2/3/4;
+- режимы — только конфигурацией: по умолчанию TEST; `test` отклоняет `mode: LIVE`;
+  неполная конфигурация (risk/instrument/simulation) → отказ с кодом 2 ДО
+  загрузки данных и без единого сетевого вызова;
+- многофакторный LIVE-гейт (`live/gate.py`): mode LIVE + флаг `--allow-live` +
+  env-подтверждение `TRADEBOT_LIVE_ACK` + секция `live.allow_orders` + явные
+  лимит/instrument/risk + отсутствие kill-switch — иначе отказ до сети;
+  даже за гейтом доступен только read-only `live-preflight` (торговый цикл
+  LIVE не реализован — roadmap L2/L3);
+- ордерный адаптер `finam/broker.py` (ТОЛЬКО за гейтом): документированные
+  методы PlaceOrder/GetOrders/GetOrder/CancelOrder/GetAccount; детерминированный
+  `client_order_id` и защита от дублей; потерянный ответ → `UNKNOWN_RESULT` →
+  сверка (слепой повтор запрещён); 429 — повтор только после окна; сверка
+  позиций со снимком счёта; kill-switch. **Статус: проверено на подменном
+  транспорте; НЕ проверено в брокерской среде; не production-ready** —
+  тесты с mock НЕ являются тестированием у брокера (docs/live.md §1);
+- интеграционные проверки с подменным Finam-клиентом: сетевая ошибка,
+  устаревшие данные, потерянный/дублирующий ответ, некорректная позиция,
+  отказ риск-контроля, отсутствие секретов в логах и журнале;
+- ручная проверка `scripts/manual_checks/check_phase_05_test_run.py` (17/17):
+  полный офлайн TEST-сценарий на демо-наборе + сценарии некорректной
+  конфигурации + LIVE-гейт.
+
+**Не реализовано (осознанно):** LIVE-оркестратор — потоковые подписки (L2),
+BarFinalizer, торговый цикл с reconciliation и алертами (L3); имитация
+подтверждений брокера; частичные исполнения и ликвидность стакана; шорты/маржа;
+мультисимвольный портфель; CatBoost-кандидат (P1). Ордерный адаптер реализован,
+но заблокирован гейтом и не проверен в брокерской среде (docs/live.md §5).
 
 ## Установка и проверка (PowerShell)
 
@@ -94,53 +127,70 @@ python -m venv .venv
 python -m pip install --upgrade pip
 python -m pip install -e ".[dev,ml]"
 
-# ручная проверка фазы 0-2 (данные; без сети и секретов) — ожидает RESULT: PASS (24/24)
-python scripts\manual_checks\check_phase_02_data.py
+# ручные проверки (офлайн, без сети и секретов):
+python scripts\manual_checks\check_phase_02_data.py        # ожидает RESULT: PASS (24/24)
+python scripts\manual_checks\check_phase_03_ml.py          # ожидает RESULT: PASS (15/15)
+python scripts\manual_checks\check_phase_04_simulation.py  # ожидает RESULT: PASS (16/16)
+python scripts\manual_checks\check_phase_05_test_run.py    # ожидает RESULT: PASS (17/17)
 
-# ручная проверка фазы 3 (ML; синтетические данные, без сети) — ожидает RESULT: PASS (15/15)
-python scripts\manual_checks\check_phase_03_ml.py
-
-# юнит-тесты
+# юнит- и интеграционные тесты
 python -m pytest -q
 
 # офлайн-валидация демо-данных и агрегации
 python -m tradebot.cli.validate_data --config configs\demo.yaml --resample 10m
 
-# обучение на своих данных (заполните configs\ml_example.yaml)
-python -m tradebot.cli.train --config configs\ml_example.yaml --timeframe 5m
+# полный TEST-путь единой командой (свои данные: configs\test_pipeline_example.yaml)
+python -m tradebot test --config configs\test_pipeline_example.yaml --timeframe 5m --train
 ```
 
+Пошаговое руководство (установка → CSV → обучение → отчёт → симуляция →
+секреты) — [docs/user_guide.md](docs/user_guide.md).
+
 Необязательная read-only проверка реального Finam API (потребует ваш secret_key;
-автоматически не запускается) — см. [docs/data.md](docs/data.md), раздел 6.
+автоматически не запускается) — `python -m tradebot.cli.smoke_readonly` или
+`python -m tradebot live-preflight` (за LIVE-гейтом) — см. docs/live.md.
 
 ## Безопасность
 
 - секреты (`TRADE_API_SECRET`, `FINAM_ACCOUNT_ID`) — только переменные окружения или
   файл `.env`, который исключён из Git; `.env.example` содержит лишь имена переменных
   и фиктивные заглушки;
-- идентификаторы счетов не печатаются в логах/отчётах; secret_key и access_key
-  маскируются в сообщениях об ошибках;
-- торговые операции в коде отсутствуют; гигиена-тесты блокируют их появление;
-- демо-данные `data/demo/` — синтетические и явно помечены как такие.
+- идентификаторы счетов не печатаются в логах/отчётах; secret_key, access_key и
+  account_id маскируются в сообщениях об ошибках, логах и журнале;
+- **LIVE выключен по умолчанию**: режим TEST; `test` отклоняет `mode: LIVE`;
+  ордерные операции существуют только в отдельном адаптере `finam/broker.py` за
+  многофакторным гейтом (docs/live.md §3) — гигиена-тесты блокируют появление
+  торговых вызовов в любых других модулях;
+- неполная/ошибочная конфигурация → безопасный отказ (код 2) до загрузки данных
+  и до любых сетевых вызовов; kill-switch-файл немедленно запрещает новые заявки;
+- демо-данные `data/demo/` и наборы ручных проверок — синтетические и явно
+  помечены как такие; проверки ордерного адаптера выполняются на подменном
+  транспорте и НЕ являются тестированием в брокерской среде.
 
 ## Структура
 
 ```
 src/tradebot/
-├── config/      # схема (pydantic), загрузка YAML, хэш, секреты из env
+├── config/      # схема (pydantic, +live-секция), загрузка YAML, хэш, секреты из env, маскирование
 ├── data/        # Bar/Timeframe, CSV loader+validator, sessions, resampler, synthetic (демо)
 ├── features/    # причинные индикаторы v1, FeatureSpec/манифест, FeatureBuilder
 ├── labels/      # целевая переменная (forward-return, нейтральная полоса)
 ├── ml/          # датасет, purged walk-forward, базовые ориентиры, метрики, обучение, реестр, отчёт
 ├── marketdata/  # интерфейсы источников данных + CsvHistorySource (TEST)
-├── finam/       # read-only REST-адаптер: transport, ratelimit, errors, client, source
-└── cli/         # validate_data (офлайн), train (офлайн), smoke_readonly (с учётными данными)
-configs/         # example.yaml, demo.yaml, ml_example.yaml
+├── finam/       # read-only REST-адаптер (transport, ratelimit, errors, client, source)
+│                # + broker.py — ордерный адаптер (ТОЛЬКО за LIVE-гейтом, docs/live.md)
+├── execution/   # контракты (вкл. BrokerGateway), сайзинг, риск-контроль, журнал (JSONL)
+├── strategy/    # источники сигналов: ModelSignalSource, ScriptedSignalSource
+├── backtest/    # EventSimulator (next-bar-open, стопы/цели), результаты, отчёт
+├── live/        # многофакторный LIVE-гейт (отказ до сети; оркестратор — roadmap L2/L3)
+└── cli/         # run (python -m tradebot: test | live-preflight), validate_data, train,
+                 # simulate, smoke_readonly
+configs/         # example, demo, ml_example, sim_demo, test_pipeline_example, live_example (LIVE выключен)
 data/demo/       # СИНТЕТИЧЕСКИЕ демонстрационные CSV
-scripts/manual_checks/  # ручные проверки фаз 0-2 и 3
-tests/           # юнит-тесты (Finam — только на подменном транспорте)
-docs/            # проектные документы
-models/, reports/ # артефакты обучения (исключены из git)
+scripts/manual_checks/  # ручные проверки фаз 0-2, 3, 4 и 5 (все офлайн)
+tests/           # юнит- и интеграционные тесты (Finam — только подменный транспорт)
+docs/            # проектные документы + user_guide.md + live.md
+models/, reports/ # артефакты обучения/прогонов (исключены из git)
 ```
 
 Python ≥ 3.10 (целевая 3.11). Ядро: `pydantic`, `PyYAML`, `tzdata` (Windows);
@@ -149,4 +199,6 @@ dev: `pytest`. Обоснование — в [pyproject.toml](pyproject.toml), a
 и [docs/ml.md](docs/ml.md) §1.
 
 Статус: исследовательский контур. Не production-ready; доходность не обещается
-(docs/decisions.md D15).
+(docs/decisions.md D15). Статусы компонентов по стадиям «реализовано / проверено
+локально / проверено на исторических данных / требует проверки пользователем или
+брокерской средой» — таблица в [docs/live.md](docs/live.md) §1.

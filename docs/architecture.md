@@ -184,6 +184,18 @@ live:                       # используется только в mode: LIV
 > kill-switch-файл, reconciliation с брокером) остаются этапом L3. Семантика
 > симулятора, рисковых гейтов и журнала — docs/simulation.md.
 
+> Статус (фаза 5): добавлены единая точка запуска `cli/run.py`
+> (`python -m tradebot test | live-preflight`), многофакторный LIVE-гейт
+> `live/gate.py` (отказ до любых сетевых вызовов) и ордерный адаптер
+> `finam/broker.py` (контракт `execution.interfaces.BrokerGateway`; только за
+> гейтом; проверен на подменном транспорте, НЕ проверен в брокерской среде).
+> Фактическая live-секция конфига — `allow_orders`, `kill_switch_file`,
+> `max_order_quantity_units`, `ack_env_var/ack_expected_value` (схема —
+> config/schema.py, образец — configs/live_example.yaml); поля эскиза
+> `dry_run`/`transport`/`max_orders_per_hour` не реализованы и появятся в L3.
+> LIVE-оркестратор (потоки, BarFinalizer, цикл сверки) по-прежнему не
+> реализован (roadmap L2/L3). Границы и статусы — docs/live.md.
+
 ### 4.1 TEST (обучение и симуляция)
 
 ```

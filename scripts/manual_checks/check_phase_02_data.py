@@ -657,11 +657,17 @@ def check_hygiene() -> str | None:
     example = (REPO_ROOT / ".env.example").read_text(encoding="utf-8")
     expect("REPLACE_WITH_YOUR_OWN" in example, ".env.example без фиктивных заглушек")
     expect("eyJ" not in example, ".env.example содержит JWT-подобное значение")
-    # токены собраны из фрагментов, чтобы проверка не обнаруживала саму себя
+    # токены собраны из фрагментов, чтобы проверка не обнаруживала саму себя.
+    # ФАЗА 5: торговые операции разрешены ТОЛЬКО в отдельном ордерном адаптере
+    # src/tradebot/finam/broker.py (за многофакторным LIVE-гейтом, docs/live.md) —
+    # файл в явном allowlist; остальные модули по-прежнему «без торговли».
     forbidden = ["/or" + "ders", "Place" + "Order", "Cancel" + "Order", "sltp-" + "orders", "new_" + "order"]
+    allowed_files = {"broker.py"}
     offenders = []
     for pattern in ("src/**/*.py", "scripts/**/*.py", "configs/*.yaml"):
         for path in REPO_ROOT.glob(pattern):
+            if path.name in allowed_files:
+                continue
             text = path.read_text(encoding="utf-8", errors="replace")
             offenders.extend(f"{path.name}:{tok}" for tok in forbidden if tok in text)
     expect(not offenders, f"упоминания торговых операций: {offenders}")

@@ -442,6 +442,35 @@ class SignalConfig(BaseModel):
         return self
 
 
+class LiveConfig(BaseModel):
+    """Граница LIVE (docs/live.md). По умолчанию всё выключено.
+
+    Для разрешения ордерного контура требуется ОДНОВРЕМЕННО (многофакторный гейт,
+    без скрытых обходов и fallback):
+    1. run.mode: LIVE в конфиге;
+    2. явный флаг CLI --allow-live у команды live-preflight/live;
+    3. переменная окружения TRADEBOT_LIVE_ACK со значением-подтверждением;
+    4. live.allow_orders: true в отдельной секции;
+    5. заданные env секрет и демо-счёт, подтверждённые параметры инструмента
+       (price_step, lot_size_units), полный risk-конфиг, live.max_order_quantity_units;
+    6. отсутствие файла kill-switch.
+    Любое невыполненное условие -> безопасный отказ ДО сетевых вызовов.
+    """
+
+    model_config = _STRICT
+
+    #: мастер-переключатель ордерного контура (по умолчанию false)
+    allow_orders: bool = False
+    #: файл аварийного выключателя: его наличие запрещает новые заявки (architecture §7)
+    kill_switch_file: str = ".kill"
+    #: максимальный размер одной заявки в штуках — ОБЯЗАТЕЛЬНО для LIVE-заявок,
+    #: дефолта нет: без явного значения гейт не проходит
+    max_order_quantity_units: int | None = Field(default=None, ge=1)
+    #: значение env-переменной-подтверждения (фиксировано, не финансовый параметр)
+    ack_env_var: str = "TRADEBOT_LIVE_ACK"
+    ack_expected_value: str = "ENABLE-LIVE"
+
+
 class SimulationConfig(BaseModel):
     """Параметры TEST-симулятора исполнения (docs/simulation.md).
 
@@ -518,6 +547,8 @@ class AppConfig(BaseModel):
     risk: RiskConfig | None = None
     instrument: InstrumentConfig | None = None
     simulation: SimulationConfig | None = None
+    #: фаза 5: граница LIVE (docs/live.md). По умолчанию None — LIVE-контур закрыт.
+    live: LiveConfig | None = None
 
     @field_validator("timeframes")
     @classmethod
