@@ -336,7 +336,7 @@ def check_a10(tmp: Path) -> None:
     pred = Predictor.load(tmp / "m10", 0.55)
 
     clock = FakeClock(BASE)
-    cfg = load_config(overrides={"mode": "TEST"})
+    cfg = load_config(overrides={"mode": "TEST", "model": {"horizon_bars": 1, "confidence_threshold": 0.55}})
     journal = Journal(tmp / "j10.json")
     pos = journal.register_entry(symbol="BTCUSDT", category="spot", direction="LONG",
                                  price=60_000.0, quantity=0.5, opened_at_ms=BASE - 5 * STEP,

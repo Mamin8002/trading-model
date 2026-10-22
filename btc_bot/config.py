@@ -63,23 +63,33 @@ class ExchangeCfg:
 @dataclass
 class ModelCfg:
     algorithm: str = "xgboost"
-    horizon_bars: int = 1
-    confidence_threshold: float = 0.55
+    horizon_bars: int = 3          # 3 бара x 5 мин = 15 мин (диапазон задачи: 2-3 = 10-15 мин)
+    confidence_threshold: Optional[float] = None  # None = порог из model card (выбранный без утечки);
+                                                  # число = ручное переопределение
     random_seed: int = 42
-    # "auto" - сравнить raw и ratio в walk-forward и выбрать лучший (фиксируется в model_card);
-    # "raw"  - признаки как в исходном ноутбуке (сырые OHLCV+turnover);
-    # "ratio"- минимально необходимая модификация: цены относительно close бара (стационарнее).
+    # "auto"  - сравнить ratio и v2 в walk-forward и применить pre-registered adopt-gate;
+    # "raw"   - признаки как в исходном ноутбуке (сырые OHLCV+turnover);
+    # "ratio" - v1: цены относительно close бара (стационарнее);
+    # "v2"    - лаг-доходности, форма бара, объём, время суток (только закрытые бары <= t).
     feature_set: str = "auto"
     # гиперпараметры XGBoost (дефолты как в исходном ноутбуке)
     n_estimators: int = 100
     max_depth: int = 6
     learning_rate: float = 0.3
-    # каталог артефакта модели; None - брать последний по дате из data.models_dir
+    # каталог артефакта модели; None - брать последний ПРИНЯТЫЙ (adopted) из data.models_dir
     artifact_dir: Optional[str] = None
 
     @property
     def horizon_minutes(self) -> int:
         return self.horizon_bars * 5  # уточняется AppConfig.horizon_minutes с учётом interval
+
+
+@dataclass
+class TradingCfg:
+    """Издержки и размер для симуляции/paper trading. Задаются ЯВНО (спецификация Этапа 5)."""
+    fee_pct: float = 0.1          # комиссия за сторону, % от цены (Bybit spot taker)
+    slippage_pct: float = 0.02    # проскальзывание за сторону, %
+    order_size_quote: float = 100.0  # виртуальный объём сделки в котировочной валюте (USDT)
 
 
 @dataclass
@@ -130,6 +140,35 @@ class UiCfg:
 
 
 @dataclass
+class IntrabarCfg:
+    """Внутрисвечной анализ по потоку сделок (publicTrade). Spike = АЛЕРТ, не сигнал входа."""
+    subscribe_trades: bool = True   # подписка на publicTrade.{symbol} в LIVE
+    window_s: int = 60              # скользящее окно для оценки быстрого движения
+    spike_pct: float = 0.15         # движение >= X% за окно -> алерт "быстрое движение"
+    cooldown_s: int = 300           # не повторять алерт чаще, чем раз в N с
+
+
+@dataclass
+class PartialTpCfg:
+    enabled: bool = False
+    at_pct: Optional[float] = None   # уровень прибыли % для частичного закрытия
+    fraction: float = 0.5            # доля позиции для частичного закрытия
+
+
+@dataclass
+class PaperCfg:
+    """Paper trading: виртуальные позиции БЕЗ отправки ордеров и без приватного API."""
+    enabled: bool = True             # в LIVE; в TEST-реплее включается флагом --paper
+    initial_balance_quote: float = 10_000.0
+    entry_min_confidence: Optional[float] = None  # None = порог модели (из card/конфига)
+    cooldown_bars: int = 1           # пауза после закрытия (в барах)
+    max_open_positions: int = 1      # конфликтующие позиции не открываются
+    intrabar_exits: bool = True      # SL/TP по тикам в LIVE (в TEST/реплее - по барам)
+    exit_at_horizon: bool = True     # закрывать по истечении горизонта прогноза (H баров)
+    partial_tp: PartialTpCfg = field(default_factory=PartialTpCfg)
+
+
+@dataclass
 class JournalCfg:
     path: str = "data/journal/journal.json"
 
@@ -143,6 +182,9 @@ class AppConfig:
     signals: SignalsCfg = field(default_factory=SignalsCfg)
     stream: StreamCfg = field(default_factory=StreamCfg)
     positions: PositionsCfg = field(default_factory=PositionsCfg)
+    trading: TradingCfg = field(default_factory=TradingCfg)
+    intrabar: IntrabarCfg = field(default_factory=IntrabarCfg)
+    paper: PaperCfg = field(default_factory=PaperCfg)
     ui: UiCfg = field(default_factory=UiCfg)
     journal: JournalCfg = field(default_factory=JournalCfg)
     project_root: Path = PROJECT_ROOT
@@ -170,12 +212,29 @@ class AppConfig:
             raise ConfigError("symbol должен быть в верхнем регистре (например BTCUSDT)")
         if self.model.horizon_bars < 1 or not isinstance(self.model.horizon_bars, int):
             raise ConfigError("model.horizon_bars должен быть целым >= 1")
-        if not (0.5 < self.model.confidence_threshold <= 1.0):
-            raise ConfigError("model.confidence_threshold должен быть в (0.5, 1.0]")
-        if self.model.feature_set not in ("auto", "raw", "ratio"):
-            raise ConfigError("model.feature_set должен быть auto|raw|ratio")
+        if not (self.model.confidence_threshold is None
+                or (0.5 < self.model.confidence_threshold <= 1.0)):
+            raise ConfigError("model.confidence_threshold должен быть null или в (0.5, 1.0]")
+        if self.model.feature_set not in ("auto", "raw", "ratio", "v2"):
+            raise ConfigError("model.feature_set должен быть auto|raw|ratio|v2")
         if self.model.n_estimators < 1 or self.model.max_depth < 1 or self.model.learning_rate <= 0:
             raise ConfigError("model.n_estimators/max_depth/learning_rate должны быть положительными")
+        if not (0 <= self.trading.fee_pct < 5 and 0 <= self.trading.slippage_pct < 5
+                and self.trading.order_size_quote > 0):
+            raise ConfigError("trading: fee_pct/slippage_pct в [0,5), order_size_quote > 0")
+        ib = self.intrabar
+        if ib.window_s < 1 or ib.spike_pct <= 0 or ib.cooldown_s < 0:
+            raise ConfigError("intrabar: window_s >= 1, spike_pct > 0, cooldown_s >= 0")
+        pp = self.paper
+        if pp.initial_balance_quote <= 0 or pp.cooldown_bars < 0 or pp.max_open_positions < 1:
+            raise ConfigError("paper: initial_balance_quote > 0, cooldown_bars >= 0, max_open_positions >= 1")
+        if pp.entry_min_confidence is not None and not (0.5 < pp.entry_min_confidence <= 1.0):
+            raise ConfigError("paper.entry_min_confidence должен быть null или в (0.5, 1.0]")
+        if pp.partial_tp.enabled:
+            if pp.partial_tp.at_pct is None or pp.partial_tp.at_pct <= 0:
+                raise ConfigError("paper.partial_tp.at_pct обязателен и > 0 при enabled=true")
+            if not (0.0 < pp.partial_tp.fraction < 1.0):
+                raise ConfigError("paper.partial_tp.fraction должен быть в (0, 1)")
         if self.signals.stale_after_intervals < 1:
             raise ConfigError("signals.stale_after_intervals должен быть >= 1")
         if self.stream.ping_interval_s < 1 or self.stream.reconnect_base_s <= 0 or self.stream.reconnect_max_s < self.stream.reconnect_base_s:
@@ -209,12 +268,16 @@ _SUBCFG = {
     "signals": SignalsCfg,
     "stream": StreamCfg,
     "positions": PositionsCfg,
+    "trading": TradingCfg,
+    "intrabar": IntrabarCfg,
+    "paper": PaperCfg,
     "ui": UiCfg,
     "journal": JournalCfg,
 }
 
 _NESTED_CFG = {
     "positions": {"exit_rules": ExitRulesCfg},
+    "paper": {"partial_tp": PartialTpCfg},
 }
 
 

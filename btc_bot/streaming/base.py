@@ -79,13 +79,38 @@ class FreshnessChange:
 
 
 @dataclass(frozen=True)
+class TradeTick:
+    """Одна сделка из публичного потока publicTrade (внутрисвечной анализ)."""
+    symbol: str
+    price: float
+    size: float
+    side: str            # "Buy" | "Sell" (сторона тейкера)
+    trade_ts_ms: int     # время сделки (T)
+    server_ts_ms: int
+    received_ms: int
+
+
+@dataclass(frozen=True)
+class SpikeEvent:
+    """Быстрое внутрисвечное движение. АЛЕРТ, не сигнал входа: вход только по
+    модели на закрытом баре и только через фильтры стратегии."""
+    direction: str       # "up" | "down"
+    move_pct: float      # движение за окно, %
+    window_s: int
+    price_start: float
+    price_end: float
+    received_ms: int
+    detail: str = ""
+
+
+@dataclass(frozen=True)
 class ErrorEvent:
     detail: str
     received_ms: int
     fatal: bool = False
 
 
-Event = KlineBar | TickerUpdate | StateChange | GapDetected | FreshnessChange | ErrorEvent
+Event = KlineBar | TickerUpdate | StateChange | GapDetected | FreshnessChange | TradeTick | SpikeEvent | ErrorEvent
 
 
 @dataclass
@@ -102,6 +127,10 @@ class StreamSnapshot:
     reconnect_count: int = 0
     gaps: list = field(default_factory=list)             # недавние GapDetected
     server_ts_ms: Optional[int] = None
+    last_trade: Optional[TradeTick] = None               # последняя сделка (publicTrade)
+    intrabar_move_pct: Optional[float] = None            # движение за скользящее окно, %
+    intrabar_window_s: int = 60
+    last_spike: Optional[SpikeEvent] = None
 
 
 class KlineStreamBase(ABC):

@@ -94,8 +94,10 @@ class Journal:
             "created_at_utc": _utc_iso(_now_ms()),
             "signals": [],
             "positions": [],
+            "paper_positions": [],   # виртуальные позиции бота (НЕ смешиваются с ручными)
+            "paper_actions": [],     # лог действий paper trading
             "events": [],
-            "counters": {"signal": 0, "position": 0},
+            "counters": {"signal": 0, "position": 0, "paper_position": 0},
         }
 
     def _load(self) -> dict:
@@ -110,6 +112,10 @@ class Journal:
             )
         if int(data.get("schema_version", 0)) != SCHEMA_VERSION:
             raise JournalError(f"Несовместимая схема журнала: {data.get('schema_version')}")
+        # обратная совместимость со старыми журналами (до Этапа 5b)
+        data.setdefault("paper_positions", [])
+        data.setdefault("paper_actions", [])
+        data.setdefault("counters", {}).setdefault("paper_position", 0)
         return data
 
     def _save(self, data: dict) -> None:
@@ -361,6 +367,54 @@ class Journal:
 
     def events(self, n: int = 50) -> list[dict]:
         return self._load()["events"][-n:]
+
+    # -- paper trading (виртуальные позиции бота) --------------------------------
+    def next_paper_id(self, data: dict) -> str:
+        data["counters"]["paper_position"] = int(data["counters"].get("paper_position", 0)) + 1
+        return f"paper-{data['counters']['paper_position']:06d}"
+
+    def save_paper_position(self, pos: dict) -> None:
+        """Создать или обновить виртуальную позицию (по position_id). Атомарно."""
+        data = self._load()
+        for i, p in enumerate(data["paper_positions"]):
+            if p["position_id"] == pos["position_id"]:
+                data["paper_positions"][i] = pos
+                break
+        else:
+            data["paper_positions"].append(pos)
+        self._save(data)
+
+    def log_paper_action(self, kind: str, details: dict) -> None:
+        data = self._load()
+        ts = _now_ms()
+        data["paper_actions"].append({"ts_ms": ts, "ts_utc": _utc_iso(ts), "kind": kind, **details})
+        self._save(data)
+
+    def paper_positions(self, status: Optional[str] = None) -> list[dict]:
+        out = self._load()["paper_positions"]
+        if status:
+            out = [p for p in out if p.get("status") == status.upper()]
+        return out
+
+    def paper_actions(self, n: int = 30) -> list[dict]:
+        return self._load()["paper_actions"][-n:]
+
+    def paper_stats(self, initial_balance: float) -> dict:
+        data = self._load()
+        poss = data["paper_positions"]
+        realized = sum(float(p.get("realized_pnl_quote") or 0.0) for p in poss)
+        open_p = [p for p in poss if p.get("status") == "OPEN"]
+        closed = [p for p in poss if p.get("status") == "CLOSED"]
+        return {
+            "initial_balance_quote": initial_balance,
+            "balance_quote": initial_balance + realized,
+            "realized_pnl_quote": realized,
+            "n_open": len(open_p),
+            "n_closed": len(closed),
+            "wins": sum(1 for p in closed if float(p.get("realized_pnl_quote") or 0) > 0),
+            "losses": sum(1 for p in closed if float(p.get("realized_pnl_quote") or 0) < 0),
+            "n_actions": len(data["paper_actions"]),
+        }
 
     def stats(self) -> dict:
         data = self._load()

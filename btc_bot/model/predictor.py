@@ -10,11 +10,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping
+from typing import Mapping, Optional, Sequence
 
 import numpy as np
 
-from .features import bar_features_frame
+from .features import SINGLE_BAR_SETS, bar_features_frame, history_features_frame
 from .train import load_artifact
 
 
@@ -36,10 +36,17 @@ class ModelPrediction:
 
 
 class Predictor:
-    def __init__(self, model, card: dict, confidence_threshold: float):
+    def __init__(self, model, card: dict, confidence_threshold: Optional[float] = None):
         self.model = model
         self.card = card
-        self.confidence_threshold = float(confidence_threshold)
+        # приоритет: явное значение (конфиг) -> порог из model card (выбранный
+        # при обучении без утечки) -> консервативный дефолт 0.55
+        thr = confidence_threshold
+        if thr is None:
+            thr = card.get("confidence_threshold")
+        if thr is None:
+            thr = 0.55
+        self.confidence_threshold = float(thr)
         # классы модели закодированы 0/1 (0 = -1 "down/flat", 1 = +1 "up")
         self._classes = list(model.classes_)
         if set(self._classes) != {0, 1}:
@@ -49,7 +56,7 @@ class Predictor:
             )
 
     @classmethod
-    def load(cls, model_dir: str | Path, confidence_threshold: float = 0.55) -> "Predictor":
+    def load(cls, model_dir: str | Path, confidence_threshold: Optional[float] = None) -> "Predictor":
         model, card = load_artifact(model_dir)
         return cls(model, card, confidence_threshold)
 
@@ -99,8 +106,28 @@ class Predictor:
         return action, raw_direction, confidence
 
     def predict_bar(self, bar: Mapping, *, signal_ts_ms: int | None = None) -> ModelPrediction:
-        """bar: словарь закрытого бара (open/high/low/close/volume/turnover[, start_ms])."""
+        """bar: словарь закрытого бара (open/high/low/close/volume/turnover[, start_ms]).
+
+        Только для single-bar наборов (raw/ratio); для v2 используйте predict_history().
+        """
+        if self.feature_set not in SINGLE_BAR_SETS:
+            raise ModelMismatchError(
+                f"feature_set={self.feature_set!r} требует окна закрытых баров - "
+                f"используйте predict_history(bars)")
         feats_frame = bar_features_frame(bar, self.feature_set)
+        return self._predict_frame(feats_frame, signal_ts_ms=signal_ts_ms)
+
+    def predict_history(self, bars: Sequence[Mapping], *,
+                        signal_ts_ms: int | None = None) -> ModelPrediction:
+        """bars: окно ЗАКРЫТЫХ баров по возрастанию start_ms, bars[-1] = текущий закрытый бар.
+
+        Для single-bar наборов достаточно одного бара; для v2 требуется
+        features.v2_min_bars(horizon_bars) баров (иначе InsufficientHistoryError).
+        """
+        feats_frame = history_features_frame(bars, self.feature_set, self.horizon_bars)
+        return self._predict_frame(feats_frame, signal_ts_ms=signal_ts_ms)
+
+    def _predict_frame(self, feats_frame, *, signal_ts_ms: int | None = None) -> ModelPrediction:
         proba = self.model.predict_proba(feats_frame)[0]
         prob_up = float(proba[self._classes.index(1)])
         action, raw_direction, confidence = self.action_from_prob_up(prob_up)

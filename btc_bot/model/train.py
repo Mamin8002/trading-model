@@ -159,7 +159,7 @@ def load_artifact(model_dir: str | Path) -> tuple[XGBClassifier, dict]:
 
 
 def find_latest_model_dir(models_root: str | Path) -> Optional[Path]:
-    """Каталог последней обученной модели (по created_at_utc в model_card.json)."""
+    """Каталог последней ПРИНЯТОЙ модели (по created_at_utc; adopted=false пропускаются)."""
     root = Path(models_root)
     if not root.exists():
         return None
@@ -170,6 +170,8 @@ def find_latest_model_dir(models_root: str | Path) -> Optional[Path]:
             try:
                 with open(card_path, "r", encoding="utf-8") as f:
                     card = json.load(f)
+                if card.get("adopted") is False:
+                    continue  # артефакт сохранён для прозрачности, но НЕ принят gate'ом
                 created = str(card.get("created_at_utc", ""))
             except (json.JSONDecodeError, OSError):
                 continue

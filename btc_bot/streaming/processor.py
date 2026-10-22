@@ -22,9 +22,11 @@ from .base import (
     FreshnessChange,
     GapDetected,
     KlineBar,
+    SpikeEvent,
     StateChange,
     StreamSnapshot,
     TickerUpdate,
+    TradeTick,
 )
 
 ClockMs = Callable[[], int]
@@ -32,6 +34,51 @@ ClockMs = Callable[[], int]
 
 def default_clock_ms() -> int:
     return int(time.time() * 1000)
+
+
+class IntrabarTracker:
+    """Скользящее окно тиков для детекции быстрых движений (spike).
+
+    Spike: |цена_now - цена_начала_окна| / цена >= spike_pct за window_s секунд.
+    Это АЛЕРТ для UI/лога, а не сигнал входа. cooldown_s ограничивает частоту алертов.
+    """
+
+    def __init__(self, window_s: int = 60, spike_pct: float = 0.15, cooldown_s: int = 300):
+        self.window_ms = int(window_s) * 1000
+        self.spike_pct = float(spike_pct)
+        self.cooldown_ms = int(cooldown_s) * 1000
+        self._ticks: deque[tuple[int, float]] = deque()
+        self._last_spike_ms: Optional[int] = None
+        self.last_move_pct: Optional[float] = None
+        self.last_spike: Optional[SpikeEvent] = None
+
+    def on_tick(self, ts_ms: int, price: float) -> Optional[SpikeEvent]:
+        self._ticks.append((ts_ms, price))
+        cutoff = ts_ms - self.window_ms
+        while self._ticks and self._ticks[0][0] < cutoff:
+            self._ticks.popleft()
+        if len(self._ticks) < 2:
+            return None
+        base_ts, base_px = self._ticks[0]
+        if base_px <= 0:
+            return None
+        move_pct = (price - base_px) / base_px * 100.0
+        self.last_move_pct = move_pct
+        if abs(move_pct) >= self.spike_pct:
+            if self._last_spike_ms is not None and (ts_ms - self._last_spike_ms) < self.cooldown_ms:
+                return None  # cooldown: не повторяем алерт
+            self._last_spike_ms = ts_ms
+            ev = SpikeEvent(
+                direction="up" if move_pct > 0 else "down",
+                move_pct=round(move_pct, 4),
+                window_s=self.window_ms // 1000,
+                price_start=base_px, price_end=price, received_ms=ts_ms,
+                detail=(f"быстрое движение {move_pct:+.3f}% за {self.window_ms // 1000} с "
+                        f"({base_px:,.2f} -> {price:,.2f}) - АЛЕРТ, не сигнал входа"),
+            )
+            self.last_spike = ev
+            return ev
+        return None
 
 
 class StreamProcessor:
@@ -43,6 +90,9 @@ class StreamProcessor:
         stale_after_intervals: int = 3,
         history_bars: int = 300,
         clock_ms: Optional[ClockMs] = None,
+        intrabar_window_s: int = 60,
+        intrabar_spike_pct: float = 0.15,
+        intrabar_cooldown_s: int = 300,
     ):
         self.symbol = symbol
         self.interval = str(interval)
@@ -50,6 +100,9 @@ class StreamProcessor:
         self._clock = clock_ms or default_clock_ms
         self._kline_topic = f"kline.{self.interval}.{self.symbol}"
         self._ticker_topic = f"tickers.{self.symbol}"
+        self._trade_topic = f"publicTrade.{self.symbol}"
+        self.tracker = IntrabarTracker(intrabar_window_s, intrabar_spike_pct, intrabar_cooldown_s)
+        self.last_trade: Optional[TradeTick] = None
 
         self.conn_state = ConnState.DISCONNECTED
         self.conn_detail = ""
@@ -124,6 +177,28 @@ class StreamProcessor:
                 ev = self._on_kline_row(row, int(msg.get("ts") or received), received)
                 if ev is not None:
                     events.extend(ev)
+            return events
+
+        if topic == self._trade_topic and data:
+            rows = data if isinstance(data, list) else [data]
+            for row in rows:
+                try:
+                    tick = TradeTick(
+                        symbol=str(row.get("s") or self.symbol),
+                        price=float(row["p"]), size=float(row.get("v", 0.0)),
+                        side=str(row.get("S", "")),
+                        trade_ts_ms=int(row.get("T") or msg.get("ts") or received),
+                        server_ts_ms=int(msg.get("ts") or received),
+                        received_ms=received,
+                    )
+                except (KeyError, TypeError, ValueError) as e:
+                    events.append(ErrorEvent(f"некорректная сделка в publicTrade: {e}", received))
+                    continue
+                self.last_trade = tick
+                events.append(tick)
+                spike = self.tracker.on_tick(tick.trade_ts_ms, tick.price)
+                if spike is not None:
+                    events.append(spike)
             return events
 
         if topic:
@@ -237,4 +312,8 @@ class StreamProcessor:
             reconnect_count=self.reconnect_count,
             gaps=list(self.recent_gaps),
             server_ts_ms=self.server_ts_ms,
+            last_trade=self.last_trade,
+            intrabar_move_pct=self.tracker.last_move_pct,
+            intrabar_window_s=self.tracker.window_ms // 1000,
+            last_spike=self.tracker.last_spike,
         )

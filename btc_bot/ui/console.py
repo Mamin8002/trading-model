@@ -80,6 +80,18 @@ def format_snapshot_text(view: dict) -> str:
         lines.append(f" Цена: {price:,.2f} USDT (ticker{f', {p_age:.0f} с назад' if p_age is not None else ''})")
     else:
         lines.append(" Цена: нет данных")
+    ib = view.get("intrabar")
+    if ib:
+        move = ib.get("move_pct")
+        move_txt = f"{move:+.3f}%/{ib.get('window_s', 60)}с" if move is not None else "нет данных"
+        lt = ib.get("last_trade")
+        lt_txt = (f"последняя сделка {lt['price']:,.2f} ({fmt_utc(lt['ts_ms'], with_date=False)})"
+                  if lt else "сделок не было")
+        lines.append(f" Внутрисвечно (publicTrade): движение {move_txt} | {lt_txt}")
+        sp = ib.get("last_spike")
+        if sp:
+            lines.append(f"   Последний алерт: {sp['direction']} {sp['move_pct']:+.3f}% "
+                         f"({fmt_utc(sp['ts_ms'], with_date=False)}) - АЛЕРТ, не сигнал входа")
     lines.append(THIN)
 
     live = view.get("live_candle")
@@ -163,6 +175,34 @@ def format_snapshot_text(view: dict) -> str:
         for r in (advice.get("reasons") or [])[:4]:
             lines.append(f"   - {r}")
 
+    paper = view.get("paper")
+    if paper:
+        lines.append(THIN)
+        st = paper.get("stats") or {}
+        lines.append(f" PAPER TRADING (виртуально, без ордеров): баланс {st.get('balance_quote', 0):,.2f} USDT "
+                     f"(старт {st.get('initial_balance_quote', 0):,.0f}, реализовано "
+                     f"{st.get('realized_pnl_quote', 0):+.4f}, закрыто {st.get('n_closed', 0)}: "
+                     f"W{st.get('wins', 0)}/L{st.get('losses', 0)})")
+        pp = paper.get("open_position")
+        if pp:
+            unreal = pp.get("unrealized_pct")
+            lines.append(f"   открыта: {pp['position_id']} LONG {pp['symbol']}: вход {pp['entry_price']:,.2f} "
+                         f"({pp.get('opened_at_utc', '?')}), {pp['quantity_open']:.8f}, текущая "
+                         f"{pp['price_now']:,.2f}" + (f" ({unreal:+.3f}%)" if unreal is not None else ""))
+            rs = pp.get("rules_snapshot") or {}
+            lines.append(f"   правила (снимок при открытии): TP {rs.get('take_profit_pct')}, "
+                         f"SL {rs.get('stop_loss_pct')}, max_hold {rs.get('max_hold_bars')}, "
+                         f"exit_at_horizon {rs.get('exit_at_horizon')} (H={rs.get('horizon_bars')})")
+            src = pp.get("source_signal") or {}
+            if src:
+                lines.append(f"   источник: сигнал {src.get('signal_id')} ({src.get('action')} "
+                             f"conf {src.get('confidence'):.3f}), модель {src.get('model_version')}")
+        else:
+            lines.append("   открытая виртуальная позиция: нет")
+        la = paper.get("last_action")
+        if la:
+            lines.append(f"   последнее действие: {la['action']} - {la['reason']}")
+
     warnings = view.get("warnings") or []
     lines.append(f" Предупреждения: {'; '.join(warnings) if warnings else 'нет'}")
     lines.append(LINE)
@@ -207,6 +247,21 @@ def format_status_line(view: dict, g: Optional[dict] = None) -> str:
         parts.append(f"{p['position_id']}{unreal}")
     if advice:
         parts.append(f"[{advice['action']}]")
+    paper = view.get("paper")
+    if paper:
+        st = paper.get("stats") or {}
+        pp = paper.get("open_position")
+        la = paper.get("last_action")
+        seg = f"P {st.get('balance_quote', 0):,.0f}"
+        if pp:
+            unreal = f" {pp['unrealized_pct']:+.2f}%" if pp.get("unrealized_pct") is not None else ""
+            seg += f" | {pp['position_id']}{unreal}"
+        if la:
+            seg += f" [{la['action']}]"
+        parts.append(seg)
+    ib = view.get("intrabar")
+    if ib and ib.get("move_pct") is not None:
+        parts.append(f"Δ{ib['window_s']}с {ib['move_pct']:+.3f}%")
     return " | ".join(parts)
 
 
@@ -253,6 +308,31 @@ def event_gap_text(ev, g: Optional[dict] = None) -> str:
     g = g or GLYPHS_UNI
     return (f"[{fmt_utc(ev.received_ms, with_date=False)}] {g['alarm']} Разрыв истории свечей: "
             f"ожидался бар {fmt_utc(ev.expected_start_ms)}, получен {fmt_utc(ev.got_start_ms)}")
+
+
+def event_spike_text(ev, g: Optional[dict] = None) -> str:
+    g = g or GLYPHS_UNI
+    arrow = g["buy"] if ev.direction == "up" else g["sell"]
+    return (f"[{fmt_utc(ev.received_ms, with_date=False)}] {g['alarm']} БЫСТРОЕ ДВИЖЕНИЕ "
+            f"{arrow} {ev.move_pct:+.3f}% за {ev.window_s} с ({ev.price_start:,.2f} → "
+            f"{ev.price_end:,.2f}) - АЛЕРТ, не сигнал входа (вход только по модели "
+            f"на закрытом баре через фильтры)")
+
+
+def event_paper_text(act, g: Optional[dict] = None) -> str:
+    """Строка действия paper trading (PaperAction)."""
+    g = g or GLYPHS_UNI
+    parts = [f"[{fmt_utc(act.ts_ms, with_date=False)}] {g['arrow']} PAPER {act.action}"]
+    if act.position_id:
+        parts.append(act.position_id)
+    if act.price is not None:
+        parts.append(f"@ {act.price:,.2f}")
+    if act.quantity is not None:
+        parts.append(f"qty {act.quantity:.8f}")
+    if act.pnl_quote is not None:
+        parts.append(f"PnL {act.pnl_quote:+.4f} USDT")
+    parts.append(f"- {act.reason}")
+    return " ".join(parts)
 
 
 def event_info(text: str) -> str:

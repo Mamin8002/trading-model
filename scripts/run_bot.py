@@ -26,8 +26,10 @@ if str(PROJECT_ROOT) not in sys.path:
 from btc_bot.bot import MonitorBot, load_predictor  # noqa: E402
 from btc_bot.config import load_config  # noqa: E402
 from btc_bot.data_sources.bybit import BybitSource, step_ms_approx  # noqa: E402
+from btc_bot.model.predictor import ModelMismatchError  # noqa: E402
 from btc_bot.portfolio.advisor import PositionAdvisor  # noqa: E402
 from btc_bot.portfolio.journal import Journal, JournalError  # noqa: E402
+from btc_bot.portfolio.paper import PaperTrader  # noqa: E402
 from btc_bot.ui.console import ConsoleUI  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -50,10 +52,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ui", choices=["auto", "dash", "line", "block"], default=None,
                    help="режим интерфейса (по умолчанию ui.mode из конфига = auto)")
     p.add_argument("--model-dir", default=None, help="переопределить каталог артефакта модели")
+    p.add_argument("--threshold", type=float, default=None,
+                   help="переопределить порог уверенности (по умолчанию - из model card)")
     p.add_argument("--journal", default=None,
                    help="путь журнала сигналов/позиций (по умолчанию: LIVE - journal.path из конфига, "
                         "TEST - data/journal/journal_test.json, чтобы демо-сигналы не смешивались "
                         "с боевой историей)")
+    p.add_argument("--paper", action="store_true",
+                   help="TEST: включить paper trading в реплее (в LIVE берётся из paper.enabled)")
+    p.add_argument("--no-paper", action="store_true", help="отключить paper trading")
+    p.add_argument("--tp", type=float, default=None, help="paper: take-profit %% (переопределяет конфиг)")
+    p.add_argument("--sl", type=float, default=None, help="paper: stop-loss %% (переопределяет конфиг)")
+    p.add_argument("--max-hold", type=int, default=None, help="paper: макс. баров удержания (переопределяет конфиг)")
     return p.parse_args()
 
 
@@ -69,6 +79,8 @@ def main() -> int:
         overrides["mode"] = args.mode
     if args.model_dir:
         overrides.setdefault("model", {})["artifact_dir"] = args.model_dir
+    if args.threshold is not None:
+        overrides.setdefault("model", {})["confidence_threshold"] = args.threshold
     cfg = load_config(args.config, overrides=overrides or None)
 
     try:
@@ -76,10 +88,15 @@ def main() -> int:
     except (FileNotFoundError, ValueError) as e:
         log.error("%s", e)
         return 2
+    except ModelMismatchError as e:
+        log.error("%s", e)
+        log.error("Конфиг изменён (например, horizon_bars) - выполните: python scripts\\train_model.py")
+        return 2
     log.info("Модель: %s (каталог %s)", predictor.model_version, model_dir)
-    log.info("Инструмент: %s/%s interval=%s, horizon=%d бар(ов) = %d мин, порог уверенности=%.2f",
+    log.info("Инструмент: %s/%s interval=%s, horizon=%d бар(ов) = %d мин, порог уверенности=%.3f (%s)",
              cfg.exchange.category, cfg.exchange.symbol, cfg.exchange.interval,
-             cfg.model.horizon_bars, cfg.horizon_minutes, cfg.model.confidence_threshold)
+             cfg.model.horizon_bars, cfg.horizon_minutes, predictor.confidence_threshold,
+             "из конфига" if cfg.model.confidence_threshold is not None else "из model card")
 
     ui_mode = "line" if args.line_ui else (args.ui or cfg.ui.mode)
     ui = ConsoleUI(mode=ui_mode, refresh_s=cfg.ui.refresh_s,
@@ -119,7 +136,48 @@ def main() -> int:
         log.info("Условия выхода в конфиге НЕ заданы: рекомендации на вход будут воздерживаться "
                  "(задайте positions.exit_rules или --tp/--sl/--max-hold при регистрации позиции).")
 
-    bot = MonitorBot(cfg, predictor, ui, rest_source=rest_source, journal=journal, advisor=advisor)
+    # paper trading (Этап 5b): виртуальные позиции, без ордеров и приватного API
+    paper = None
+    paper_enabled = cfg.paper.enabled and not args.no_paper
+    if cfg.mode == "TEST" and not args.paper:
+        paper_enabled = False  # в TEST-реплее paper включается явным флагом --paper
+    if paper_enabled:
+        pr = dict(default_rules)  # копия, чтобы CLI-переопределения не меняли конфиг молча
+        if args.tp is not None:
+            pr["take_profit_pct"] = args.tp
+        if args.sl is not None:
+            pr["stop_loss_pct"] = args.sl
+        if args.max_hold is not None:
+            pr["max_hold_bars"] = args.max_hold
+        paper = PaperTrader(
+            journal,
+            symbol=cfg.exchange.symbol, category=cfg.exchange.category,
+            fee_pct=cfg.trading.fee_pct, slippage_pct=cfg.trading.slippage_pct,
+            order_size_quote=cfg.trading.order_size_quote,
+            exit_rules=pr,
+            entry_min_confidence=cfg.paper.entry_min_confidence,
+            cooldown_bars=cfg.paper.cooldown_bars,
+            max_open_positions=cfg.paper.max_open_positions,
+            intrabar_exits=cfg.paper.intrabar_exits,
+            exit_at_horizon=cfg.paper.exit_at_horizon,
+            partial_tp={"enabled": cfg.paper.partial_tp.enabled,
+                        "at_pct": cfg.paper.partial_tp.at_pct,
+                        "fraction": cfg.paper.partial_tp.fraction},
+            interval_step_ms=step_ms_approx(cfg.exchange.interval),
+            horizon_bars=cfg.model.horizon_bars,
+        )
+        log.info("Paper trading ВКЛЮЧЕН (виртуально, без ордеров): баланс %.2f USDT, "
+                 "сделка %.2f USDT, fee %.2f%%, slip %.3f%%, правила выхода: TP=%s SL=%s max_hold=%s, "
+                 "exit_at_horizon=%s (H=%d)",
+                 cfg.paper.initial_balance_quote, cfg.trading.order_size_quote,
+                 cfg.trading.fee_pct, cfg.trading.slippage_pct,
+                 pr.get("take_profit_pct"), pr.get("stop_loss_pct"), pr.get("max_hold_bars"),
+                 cfg.paper.exit_at_horizon, cfg.model.horizon_bars)
+        if not paper._rules_defined():
+            log.info("Paper: правила выхода не заданы и exit_at_horizon=false -> входы будут воздерживаться.")
+
+    bot = MonitorBot(cfg, predictor, ui, rest_source=rest_source, journal=journal,
+                     advisor=advisor, paper=paper)
 
     if cfg.mode == "TEST":
         replay = Path(args.replay_file) if args.replay_file else find_replay_file(cfg)

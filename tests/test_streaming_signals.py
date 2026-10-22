@@ -68,7 +68,7 @@ def predictor():
 
 
 def make_bot(predictor, clock):
-    cfg = load_config(overrides={"mode": "TEST"})
+    cfg = load_config(overrides={"mode": "TEST", "model": {"horizon_bars": 1, "confidence_threshold": 0.55}})
     return MonitorBot(cfg, predictor, ConsoleUI(stream=io.StringIO(), force_line_mode=True),
                       clock_ms=clock)
 

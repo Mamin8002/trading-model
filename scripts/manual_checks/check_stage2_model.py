@@ -234,6 +234,7 @@ def find_real_dataset() -> Path | None:
 
 
 def check_b_real_smoke(cfg) -> None:
+    thr = cfg.model.confidence_threshold if cfg.model.confidence_threshold is not None else 0.55
     data_path = find_real_dataset()
     if data_path is None:
         record("B1 реальные данные: загрузка + walk-forward + артефакт", False,
@@ -253,7 +254,7 @@ def check_b_real_smoke(cfg) -> None:
     prices = df_clean[["start_ms", "close"]]
     wf = walk_forward_validate(X, y, times, prices, cfg.exchange.interval, horizon_bars=H,
                                feature_set="ratio", n_folds=3, train_fraction=0.5,
-                               threshold=cfg.model.confidence_threshold,
+                               threshold=thr,
                                seed=cfg.model.random_seed, n_estimators=40)
     prev_end = None
     for f in wf.folds:
@@ -279,12 +280,12 @@ def check_b_real_smoke(cfg) -> None:
         symbol=cfg.exchange.symbol, category=cfg.exchange.category, interval=cfg.exchange.interval,
         horizon_bars=H, horizon_minutes=H * cfg.exchange.interval_minutes,
         feature_set="ratio", features=feature_columns("ratio"),
-        confidence_threshold=cfg.model.confidence_threshold,
+        confidence_threshold=thr,
         training_data={"file": str(data_path), "n_bars": int(ds.n_rows)},
         walk_forward_summary=wf.aggregate, library_versions=library_versions(),
     )
     save_artifact(model, models_root / version, card, walk_forward=wf.to_dict())
-    pred = Predictor.load(models_root / version, cfg.model.confidence_threshold)
+    pred = Predictor.load(models_root / version, thr)
     pred.ensure_compatible(symbol=cfg.exchange.symbol, category=cfg.exchange.category,
                            interval=cfg.exchange.interval, horizon_bars=H)
     last_bar = df_clean.iloc[-1].to_dict()
@@ -320,7 +321,8 @@ def main() -> int:
     cfg = load_config()
     print(f"Конфиг: {cfg.exchange.category}/{cfg.exchange.symbol} interval={cfg.exchange.interval}, "
           f"horizon_bars={cfg.model.horizon_bars} ({cfg.horizon_minutes} мин), "
-          f"threshold={cfg.model.confidence_threshold}, seed={cfg.model.random_seed}")
+          f"threshold={cfg.model.confidence_threshold if cfg.model.confidence_threshold is not None else '0.55 (дефолт)'},"
+          f" seed={cfg.model.random_seed}")
     check_a1_features()
     check_a2_embargo_and_folds()
     check_a3_artifact_roundtrip()

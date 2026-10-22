@@ -117,7 +117,7 @@ def kline_msg(start_ms: int, row: dict, confirm: bool, ts_ms: int) -> dict:
 
 
 def make_bot(predictor: Predictor, clock: FakeClock) -> MonitorBot:
-    cfg = load_config(overrides={"mode": "TEST"})
+    cfg = load_config(overrides={"mode": "TEST", "model": {"horizon_bars": 1, "confidence_threshold": 0.55}})
     ui = ConsoleUI(stream=io.StringIO(), force_line_mode=True)
     return MonitorBot(cfg, predictor, ui, clock_ms=clock)
 
@@ -403,6 +403,7 @@ def check_a10_live_pipeline_local(tmp: Path) -> None:
             pred = make_test_predictor(tmp / "m10")
             cfg = load_config(overrides={
                 "mode": "LIVE",
+                "model": {"horizon_bars": 1, "confidence_threshold": 0.55},
                 "exchange": {"ws_public_url": f"ws://127.0.0.1:{port}/v5/public/spot"},
             })
             ui = ConsoleUI(stream=io.StringIO(), force_line_mode=True)

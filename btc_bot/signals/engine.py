@@ -16,14 +16,18 @@
 from __future__ import annotations
 
 import itertools
+import logging
 import time
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 from ..data_sources.bybit import step_ms_approx
+from ..model.features import InsufficientHistoryError
 from ..model.predictor import Predictor
 from ..streaming.base import ConnState, FreshnessChange, GapDetected, KlineBar
+
+logger = logging.getLogger(__name__)
 
 ClockMs = Callable[[], int]
 
@@ -102,8 +106,15 @@ class SignalEngine:
         self._pending_gap = True
 
     # -- signals ----------------------------------------------------------------
-    def on_confirmed_bar(self, bar: KlineBar) -> Optional[Signal]:
-        """Обработка закрытого бара. Возвращает Signal или None (дубликат)."""
+    def on_confirmed_bar(self, bar: KlineBar,
+                         history: Optional[list] = None) -> Optional[Signal]:
+        """Обработка закрытого бара. Возвращает Signal или None (дубликат / нет истории).
+
+        history: окно закрытых баров (KlineBar) по возрастанию, bars[-1] == bar -
+        требуется для feature_set "v2" (лаг-признаки); для raw/ratio не используется.
+        Если для v2 истории недостаточно - сигнал не выдаётся (логируется), данные
+        не фабрикуются.
+        """
         if not bar.confirmed:
             raise ValueError("SignalEngine принимает только закрытые бары (confirmed=True)")
         if bar.start_ms in self._processed_starts:
@@ -136,7 +147,23 @@ class SignalEngine:
         if bar.origin == "backfill":
             reasons.append("бар доставлен REST-догрузкой после разрыва")
 
-        pred = self.predictor.predict_bar(bar.as_feature_mapping())
+        # предсказание: single-bar наборы (raw/ratio) - по одному бару;
+        # v2 - по окну закрытых баров (лаг-признаки). При нехватке истории для v2
+        # сигнал НЕ выдаётся (данные не фабрикуются).
+        try:
+            if self.predictor.feature_set in ("raw", "ratio"):
+                pred = self.predictor.predict_bar(bar.as_feature_mapping())
+            else:
+                hist = list(history) if history else [bar]
+                if hist[-1].start_ms != bar.start_ms:
+                    hist = [b for b in hist if b.start_ms < bar.start_ms] + [bar]
+                pred = self.predictor.predict_history(
+                    [{"start_ms": b.start_ms, **b.as_feature_mapping()} for b in hist])
+        except InsufficientHistoryError as e:
+            logger.warning("Сигнал пропущен (недостаточно истории для %s): %s",
+                           self.predictor.feature_set, e)
+            return None
+
         if pred.action == "HOLD":
             reasons.append(
                 f"воздержание: уверенность {pred.confidence:.3f} < порога "

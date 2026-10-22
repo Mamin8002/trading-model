@@ -32,8 +32,10 @@ from .streaming.base import (
     FreshnessChange,
     GapDetected,
     KlineBar,
+    SpikeEvent,
     StateChange,
     TickerUpdate,
+    TradeTick,
 )
 from .streaming.bybit_ws import BybitWsClient
 from .streaming.processor import StreamProcessor
@@ -43,7 +45,9 @@ from .ui.console import (
     event_fresh_text,
     event_gap_text,
     event_info,
+    event_paper_text,
     event_signal_text,
+    event_spike_text,
     event_state_text,
     format_snapshot_text,
     format_status_line,
@@ -74,18 +78,23 @@ class MonitorBot:
     def __init__(self, cfg: AppConfig, predictor: Predictor, ui: ConsoleUI,
                  clock_ms: Optional[Callable[[], int]] = None,
                  rest_source: Optional[BybitSource] = None,
-                 journal=None, advisor=None):
+                 journal=None, advisor=None, paper=None):
         self.cfg = cfg
         self.predictor = predictor
         self.ui = ui
         self.journal = journal          # portfolio.journal.Journal | None
         self.advisor = advisor          # portfolio.advisor.PositionAdvisor | None
+        self.paper = paper              # portfolio.paper.PaperTrader | None (Этап 5b)
+        self.paper_initial_balance = float(cfg.paper.initial_balance_quote)
         self.last_advice = None
         self.processor = StreamProcessor(
             cfg.exchange.symbol, cfg.exchange.interval,
             stale_after_intervals=cfg.signals.stale_after_intervals,
             history_bars=cfg.stream.history_bars,
             clock_ms=clock_ms,
+            intrabar_window_s=cfg.intrabar.window_s,
+            intrabar_spike_pct=cfg.intrabar.spike_pct,
+            intrabar_cooldown_s=cfg.intrabar.cooldown_s,
         )
         self.engine = SignalEngine(
             predictor,
@@ -107,7 +116,15 @@ class MonitorBot:
         logged = False
         for ev in events:
             if isinstance(ev, KlineBar) and ev.confirmed:
-                sig = self.engine.on_confirmed_bar(ev)
+                # сначала баровые выходы paper-позиции (по этому закрытому бару),
+                # затем модельный сигнал (он может открыть/закрыть позицию)
+                if self.paper is not None:
+                    act = self.paper.on_bar(ev)
+                    if act is not None:
+                        self.ui.log_event(event_paper_text(act))
+                        logged = True
+                hist = [b for b in self.processor.confirmed if b.start_ms <= ev.start_ms][-30:]
+                sig = self.engine.on_confirmed_bar(ev, history=hist)
                 if sig is not None:
                     new_signals.append(sig)
             elif isinstance(ev, StateChange):
@@ -124,12 +141,28 @@ class MonitorBot:
                 self.engine.on_gap(ev)
                 self.ui.log_event(event_gap_text(ev))
                 logged = True
+            elif isinstance(ev, SpikeEvent):
+                # АЛЕРТ: не сигнал входа, не открытие позиции; только уведомление
+                self.ui.log_event(event_spike_text(ev))
+                logged = True
+            elif isinstance(ev, TradeTick):
+                if self.paper is not None:
+                    act = self.paper.on_tick(ev.price, ev.trade_ts_ms)
+                    if act is not None:
+                        self.ui.log_event(event_paper_text(act))
+                        logged = True
             elif isinstance(ev, ErrorEvent):
                 logger.warning("Ошибка стрима: %s", ev.detail)
         for sig in new_signals:
             self.ui.log_event(event_signal_text(sig))
             logged = True
             self._journal_and_advise(sig)
+            if self.paper is not None:
+                price_now = (self.processor.last_price.price
+                             if self.processor.last_price else sig.price_at_signal)
+                act = self.paper.on_signal(sig, price_now)
+                if act is not None:
+                    self.ui.log_event(event_paper_text(act))
             if self.on_signal:
                 self.on_signal(sig)
         if logged and self.ui.mode == "line":
@@ -247,6 +280,44 @@ class MonitorBot:
             except Exception as e:  # noqa: BLE001 - проблемы журнала не роняют мониторинг
                 warnings.append(f"журнал недоступен: {e}")
 
+        # -- Этап 5b: внутрисвечной анализ + paper trading --
+        intrabar_view = None
+        if snap.last_trade is not None or snap.intrabar_move_pct is not None:
+            intrabar_view = {
+                "move_pct": snap.intrabar_move_pct,
+                "window_s": snap.intrabar_window_s,
+                "last_trade": ({"price": snap.last_trade.price, "ts_ms": snap.last_trade.trade_ts_ms}
+                               if snap.last_trade else None),
+                "last_spike": ({"direction": snap.last_spike.direction,
+                                "move_pct": snap.last_spike.move_pct,
+                                "ts_ms": snap.last_spike.received_ms} if snap.last_spike else None),
+            }
+        paper_view = None
+        if self.paper is not None and self.journal is not None:
+            try:
+                pstats = self.journal.paper_stats(self.paper_initial_balance)
+                popens = self.paper.open_positions()
+                popen_view = None
+                if popens:
+                    p = popens[-1]
+                    popen_view = {
+                        "position_id": p["position_id"], "symbol": p["symbol"],
+                        "entry_price": p["entry_price"], "opened_at_utc": p.get("opened_at_utc"),
+                        "quantity_open": p["quantity_open"],
+                        "price_now": price_now,
+                        "unrealized_pct": ((price_now - p["entry_price"]) / p["entry_price"] * 100.0
+                                           if price_now else None),
+                        "rules_snapshot": p.get("rules_snapshot"),
+                        "source_signal": p.get("source_signal"),
+                    }
+                paper_view = {
+                    "stats": pstats,
+                    "open_position": popen_view,
+                    "last_action": (self.paper.last_action.to_dict() if self.paper.last_action else None),
+                }
+            except Exception as e:  # noqa: BLE001
+                warnings.append(f"paper-журнал недоступен: {e}")
+
         return {
             "mode": self.mode,
             "exchange": {"category": self.cfg.exchange.category,
@@ -274,6 +345,8 @@ class MonitorBot:
             "portfolio_stats": stats,
             "journal_path": journal_path,
             "last_advice": (self.last_advice.to_dict() if self.last_advice else None),
+            "intrabar": intrabar_view,
+            "paper": paper_view,
             "warnings": warnings,
             "rendered_at_ms": now_ms,
         }
@@ -281,6 +354,10 @@ class MonitorBot:
     # -- LIVE ------------------------------------------------------------------
     def run_live(self, duration_s: float = 0.0) -> int:
         q: "queue.Queue" = queue.Queue(maxsize=10000)
+        topics = [f"kline.{self.cfg.exchange.interval}.{self.cfg.exchange.symbol}",
+                  f"tickers.{self.cfg.exchange.symbol}"]
+        if self.cfg.intrabar.subscribe_trades:
+            topics.append(f"publicTrade.{self.cfg.exchange.symbol}")
         client = BybitWsClient(
             self.cfg.exchange.ws_public_url, self.cfg.exchange.symbol,
             self.cfg.exchange.interval, q,
@@ -289,6 +366,7 @@ class MonitorBot:
             recv_timeout_s=self.cfg.stream.recv_timeout_s,
             reconnect_base_s=self.cfg.stream.reconnect_base_s,
             reconnect_max_s=self.cfg.stream.reconnect_max_s,
+            subscribe_topics=topics,
         )
         client.start()
         self.ui.begin()
@@ -338,9 +416,11 @@ class MonitorBot:
 
         interval_ms = step_ms_approx(self.cfg.exchange.interval)
         fake_now = {"ms": int(df["start_ms"].iloc[0])}
-        # фейковые часы: весь тракт (processor/engine) работает от них - детерминированно
+        # фейковые часы: весь тракт (processor/engine/paper) работает от них - детерминированно
         self.processor._clock = lambda: fake_now["ms"]
         self.engine._clock = lambda: fake_now["ms"]
+        if self.paper is not None:
+            self.paper._clock = lambda: fake_now["ms"]
         self.mode = "TEST"
 
         def emit(msg: dict) -> list[Signal]:
@@ -397,6 +477,13 @@ class MonitorBot:
         n_fresh = sum(1 for s in all_signals if s.data_fresh)
         n_hold = sum(1 for s in all_signals if s.action == "HOLD")
         print()
+        paper_txt = ""
+        if self.paper is not None and self.journal is not None:
+            st = self.journal.paper_stats(self.paper_initial_balance)
+            paper_txt = (f"; PAPER: баланс {st['balance_quote']:,.2f} USDT "
+                         f"(realized {st['realized_pnl_quote']:+.4f}), открыто {st['n_open']}, "
+                         f"закрыто {st['n_closed']} (W{st['wins']}/L{st['losses']}), "
+                         f"действий {st['n_actions']}")
         print(f"TEST-реплей завершён: баров {len(df)}, сигналов {len(all_signals)} "
-              f"(fresh {n_fresh}, HOLD/воздержание {n_hold})")
+              f"(fresh {n_fresh}, HOLD/воздержание {n_hold}){paper_txt}")
         return 0

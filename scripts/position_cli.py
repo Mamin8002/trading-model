@@ -97,6 +97,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     e = sub.add_parser("events", help="журнал событий")
     e.add_argument("--last", type=int, default=20)
+
+    sub.add_parser("paper-stats", help="статистика paper trading (виртуальные сделки)")
+
+    pl = sub.add_parser("paper-list", help="виртуальные позиции")
+    pl.add_argument("--all", action="store_true", help="включая закрытые")
+
+    ph = sub.add_parser("paper-history", help="лог действий paper trading")
+    ph.add_argument("--last", type=int, default=30)
     return p
 
 
@@ -205,6 +213,50 @@ def cmd_events(journal: Journal, args) -> int:
     return 0
 
 
+def cmd_paper_stats(journal: Journal, cfg) -> int:
+    st = journal.paper_stats(cfg.paper.initial_balance_quote)
+    print("Paper trading (ВИРТУАЛЬНЫЕ сделки; ордера не отправлялись):")
+    for k, v in st.items():
+        print(f"  {k}: {v:+.4f}" if isinstance(v, float) else f"  {k}: {v}")
+    print("Издержки: fee "
+          f"{cfg.trading.fee_pct}%/сторона, slippage {cfg.trading.slippage_pct}%/сторона, "
+          f"объём {cfg.trading.order_size_quote} USDT/сделку")
+    return 0
+
+
+def cmd_paper_list(journal: Journal, args) -> int:
+    poss = journal.paper_positions() if args.all else journal.paper_positions("OPEN")
+    if not poss:
+        print("Виртуальных позиций нет." if args.all else "Открытых виртуальных позиций нет.")
+        return 0
+    for p in poss:
+        rs = p.get("rules_snapshot") or {}
+        src = p.get("source_signal") or {}
+        print(f"{p['position_id']} [{p['status']}] LONG {p['symbol']}: вход {p['entry_price']:,.2f} "
+              f"({p.get('opened_at_utc')}), qty {p['quantity_open']:.8f}/{p['quantity_initial']:.8f}, "
+              f"realized {p.get('realized_pnl_quote') or 0:+.4f} USDT, outcome {p.get('outcome') or '-'}")
+        print(f"  правила(снимок): TP={rs.get('take_profit_pct')} SL={rs.get('stop_loss_pct')} "
+              f"max_hold={rs.get('max_hold_bars')} exit_at_horizon={rs.get('exit_at_horizon')} "
+              f"(H={rs.get('horizon_bars')}) fee={rs.get('fee_pct')}% slip={rs.get('slippage_pct')}%")
+        if src:
+            print(f"  источник: сигнал {src.get('signal_id')} ({src.get('action')} "
+                  f"conf {src.get('confidence'):.3f}), модель {src.get('model_version')}")
+    return 0
+
+
+def cmd_paper_history(journal: Journal, args) -> int:
+    acts = journal.paper_actions(args.last)
+    if not acts:
+        print("Действий paper trading пока нет.")
+        return 0
+    for a in acts:
+        print(f"{a['ts_utc']}  {a['kind']:<14} pos={a.get('position_id') or '-':<14} "
+              f"px={a.get('price') if a.get('price') is None else format(a['price'], ',.2f')} "
+              f"pnl={a.get('pnl_quote') if a.get('pnl_quote') is None else format(a['pnl_quote'], '+.4f')} "
+              f"| {a.get('reason', '')[:120]}")
+    return 0
+
+
 def main() -> int:
     args = build_parser().parse_args()
     cfg = load_config(args.config)
@@ -229,6 +281,12 @@ def main() -> int:
             return cmd_stats(journal)
         if args.cmd == "events":
             return cmd_events(journal, args)
+        if args.cmd == "paper-stats":
+            return cmd_paper_stats(journal, cfg)
+        if args.cmd == "paper-list":
+            return cmd_paper_list(journal, args)
+        if args.cmd == "paper-history":
+            return cmd_paper_history(journal, args)
     except JournalError as e:
         print(f"ОШИБКА: {e}", file=sys.stderr)
         return 2

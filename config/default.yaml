@@ -4,7 +4,7 @@
 
 # TEST  - офлайн-прогон на сохранённых данных и демонстрационных сценариях
 # LIVE  - публичные данные Bybit в реальном времени (WebSocket)
-mode: LIVE
+mode: TEST
 
 exchange:
   source: bybit            # интерфейс MarketDataSource позволяет добавить другие биржи
@@ -19,14 +19,23 @@ exchange:
 
 model:
   algorithm: xgboost       # по выводу исходного репозитория: XGBoost лучший на 5-min данных
-  horizon_bars: 1          # на сколько баров вперёд смотреть (1 бар = 5 минут при interval=5)
-  confidence_threshold: 0.55   # ниже порога -> HOLD/воздержание от рекомендации
+  horizon_bars: 3          # на сколько баров вперёд смотреть: 3 бара x 5 мин = 15 минут
+                           # (диапазон задачи 10-15 мин = horizon_bars 2..3 при interval=5)
+  confidence_threshold: null  # null = порог из model card (выбран при обучении БЕЗ утечки);
+                              # число (0.5..1.0] = ручное переопределение
   random_seed: 42
-  feature_set: auto        # auto | raw (как в оригинальном ноутбуке) | ratio (цены относительно close)
+  feature_set: auto        # auto | raw | ratio | v2; auto = сравнить ratio и v2
+                           # walk-forward'ом и применить pre-registered adopt-gate
   n_estimators: 100        # дефолты XGBoost, как в исходном ноутбуке
   max_depth: 6
   learning_rate: 0.3
-  artifact_dir: null       # null = брать последнюю обученную модель из data.models_dir
+  artifact_dir: null       # null = последний ПРИНЯТЫЙ (adopted) артефакт из data.models_dir
+
+# Издержки для симуляции торговли и paper trading (задаются ЯВНО, влияют на net-метрики)
+trading:
+  fee_pct: 0.1             # комиссия за сторону, % (Bybit spot taker 0.1%)
+  slippage_pct: 0.02       # проскальзывание за сторону, %
+  order_size_quote: 100    # виртуальный объём сделки, USDT
 
 data:
   history_start: "2024-01-01"  # начало истории для загрузки/обучения (UTC)
@@ -70,6 +79,30 @@ ui:
   log_events: true  # печатать значимые события отдельными строками (line/block)
   refresh_s: 1.0    # частота обновления статусной строки
   colors: auto      # auto = включать цвет только при поддержке ANSI
+
+intrabar:
+  # Внутрисвечной анализ по потоку сделок publicTrade (LIVE). Spike = АЛЕРТ,
+  # НЕ сигнал входа: вход только по модели на закрытом баре + фильтры стратегии.
+  subscribe_trades: true   # подписка на publicTrade.{symbol}
+  window_s: 60             # скользящее окно оценки быстрого движения, с
+  spike_pct: 0.15          # движение >= X% за окно -> алерт
+  cooldown_s: 300          # не повторять алерт чаще раза в N с
+
+paper:
+  # Paper trading: ВИРТУАЛЬНЫЕ позиции. Ордера не отправляются, приватный API не
+  # используется. Издержки - из секции trading; правила выхода - positions.exit_rules
+  # (фиксируются снимком при открытии и не меняются молча во время работы).
+  enabled: true              # в LIVE; в TEST-реплее включается флагом --paper
+  initial_balance_quote: 10000
+  entry_min_confidence: null # null = порог модели (из card/конфига)
+  cooldown_bars: 1           # пауза после закрытия, баров
+  max_open_positions: 1      # конфликтующие позиции не открываются
+  intrabar_exits: true       # SL/TP по тикам в LIVE (в TEST/реплее - по закрытым барам)
+  exit_at_horizon: true      # закрывать позицию по истечении горизонта прогноза (H баров)
+  partial_tp:                # частичная фиксация прибыли (не обязательна)
+    enabled: false
+    at_pct: null             # например 0.8 = +0.8% от входа
+    fraction: 0.5            # доля позиции
 
 journal:
   path: data/journal/journal.json   # история сигналов + ручные позиции (переживает перезапуск)

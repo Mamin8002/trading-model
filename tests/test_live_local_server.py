@@ -102,6 +102,7 @@ def test_run_live_on_local_fake_server(predictor):  # noqa: F811
         threading.Thread(target=server.serve_forever, daemon=True).start()
         cfg = load_config(overrides={
             "mode": "LIVE",
+            "model": {"horizon_bars": 1, "confidence_threshold": 0.55},
             "exchange": {"ws_public_url": f"ws://127.0.0.1:{port}/v5/public/spot"},
         })
         ui = ConsoleUI(stream=io.StringIO(), force_line_mode=True)
