@@ -113,6 +113,19 @@ def main() -> int:
         return 2
 
     n_unclosed = sum(1 for k in klines if not k.is_closed)
+
+    from btc_bot.data.store import klines_to_dataframe
+    from btc_bot.data_sources.bybit import step_ms_approx
+    df_raw = klines_to_dataframe(klines)
+    df_clean, report = clean_klines(df_raw, ex.interval)
+
+    step = step_ms_approx(ex.interval)
+    span_expected = (report.period_end_ms - report.period_start_ms) // step + 1 if report.n_output else 0
+    coverage_pct = (report.n_output / span_expected * 100.0) if span_expected else 0.0
+    requested_expected = max(1, (end_ms - start_ms) // step)
+    requested_coverage_pct = report.n_output / requested_expected * 100.0
+    tail_lag_ms = end_ms - (report.period_end_ms or end_ms)
+
     csv_path, meta_path = save_klines_csv(
         klines,
         raw_path,
@@ -120,13 +133,21 @@ def main() -> int:
         category=ex.category,
         symbol=ex.symbol,
         interval=ex.interval,
-        extra_meta={"requested_start_ms": start_ms, "requested_end_ms": end_ms},
+        extra_meta={
+            "requested_start_ms": start_ms, "requested_end_ms": end_ms,
+            "coverage_pct_of_fetched_span": round(coverage_pct, 4),
+            "coverage_pct_of_requested_span": round(requested_coverage_pct, 4),
+            "archive_gaps": [g.to_dict() for g in report.gaps],
+            "archive_gaps_missing_bars": report.total_missing_bars,
+            "coverage_note": (
+                "coverage<100% означает, что в архиве биржи отсутствуют бары "
+                "(границы архивных сегментов/технические пропуски). Данные НЕ заполнялись."),
+        },
     )
     log.info("RAW сохранён: %s (%d строк, незакрытых на момент загрузки: %d)", csv_path, len(klines), n_unclosed)
     log.info("METADATA: %s", meta_path)
 
-    df_raw = pd.read_csv(csv_path)
-    df_clean, report = clean_klines(df_raw, ex.interval)
+    clean_path.parent.mkdir(parents=True, exist_ok=True)
     df_clean.to_csv(clean_path, index=False)
     with open(report_path, "w", encoding="utf-8") as f:
         json.dump(report.to_dict(), f, indent=2, ensure_ascii=False, default=str)
@@ -143,6 +164,19 @@ def main() -> int:
     print(f"Незакрытые исключены:  {report.n_unconfirmed_excluded}")
     print(f"Диапазоны пропусков:   {len(report.gaps)} (всего отсутствующих баров: {report.total_missing_bars})")
     print(f"Чистых баров:          {report.n_output}")
+    print(f"Покрытие:              {coverage_pct:.2f}% загруженного диапазона "
+          f"({requested_coverage_pct:.2f}% запрошенного периода)")
+    if report.gaps:
+        print("ОТСУТСТВУЮЩИЕ ДИАПАЗОНЫ (архив биржи неполон; бары НЕ заполнялись):")
+        for g in report.gaps[:10]:
+            a = pd.Timestamp(g.after_start_ms, unit="ms", tz="UTC").strftime("%Y-%m-%d %H:%M")
+            b = pd.Timestamp(g.until_start_ms, unit="ms", tz="UTC").strftime("%Y-%m-%d %H:%M")
+            print(f"  {a} -> {b}  ({g.missing_bars} баров)")
+        if len(report.gaps) > 10:
+            print(f"  ... и ещё {len(report.gaps) - 10} диапазон(ов)")
+    if tail_lag_ms > max(12 * step, 3_600_000):
+        print(f"ВНИМАНИЕ: последняя свеча на {tail_lag_ms / 3_600_000:.1f} ч раньше конца запроса - "
+              f"проверьте, не оборвалась ли загрузка")
     print(f"Файлы:                 {csv_path.name}, {clean_path.name}, {report_path.name}")
     print("Пропуски НЕ заполнялись - данные сохранены как получены от биржи.")
     return 0

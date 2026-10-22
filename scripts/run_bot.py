@@ -67,9 +67,18 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def find_replay_file(cfg) -> Path | None:
-    files = sorted(cfg.resolve(cfg.data.processed_dir).glob("*.clean.csv"))
-    return files[-1] if files else None
+def find_replay_file(cfg) -> Optional[Path]:
+    """Самый свежий clean-файл ПО ДАТЕ ЗАГРУЗКИ (fetched<UTC> в имени)."""
+    import re
+    files = list(cfg.resolve(cfg.data.processed_dir).glob("*.clean.csv"))
+    if not files:
+        return None
+
+    def key(p: Path):
+        m = re.search(r"fetched(\d{8}T\d{6}Z)", p.name)
+        return (m.group(1) if m else "", p.stat().st_mtime, p.name)
+
+    return max(files, key=key)
 
 
 def main() -> int:

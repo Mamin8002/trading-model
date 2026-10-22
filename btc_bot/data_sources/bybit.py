@@ -249,7 +249,16 @@ class BybitSource(MarketDataSource):
         Первая свеча может начинаться чуть раньше запрошенного start - сервер
         возвращает свечу, СОДЕРЖАЩУЮ момент start (выравнивание по сетке).
 
-        Останов: next_start > end_ms / получили меньше limit свечей / нет прогресса.
+        Границы архива: у Bybit встречаются сегменты архива (например, spot 5m
+        около 2022-04-11), где запрос со start у границы возвращает страницу,
+        ЗАКАНЧИВАЮЩУЮСЯ ДО start (пагинация стопорится), а реальные данные
+        возобновляются позже (в архиве присутствует пропуск). В таком случае
+        выполняется зондирование вперёд (1ч, 6ч, 1d, 3d, 7d, 14d, 28d) до
+        возобновления данных; отсутствующие бары НЕ заполняются - разрыв будет
+        виден в отчёте очистки (gaps).
+
+        Останов: next_start > end_ms / сервер не вернул новых данных до конца
+        истории / зондирование не нашло продолжения / исчерпан max_pages.
         """
         # для внутридневных интервалов шаг точный; для D/W/M - через period_end_ms (переменная длина)
         fixed_step_ms = None if interval in ("D", "W", "M") else interval_to_ms(interval)
@@ -257,14 +266,10 @@ class BybitSource(MarketDataSource):
         cursor = start_ms
         page_size = min(int(limit), MAX_LIMIT)
         pages = 0
+        recoveries = 0
+        max_recoveries = 8
 
-        while True:
-            batch, _srv = self.fetch_kline_page(
-                symbol, category, interval, start_ms=cursor, end_ms=None, limit=page_size
-            )
-            pages += 1
-            if not batch:
-                break
+        def merge(batch: list[Kline]) -> None:
             for k in batch:
                 if end_ms is not None and k.start_ms > end_ms:
                     continue
@@ -272,26 +277,97 @@ class BybitSource(MarketDataSource):
                 prev = by_start.get(k.start_ms)
                 if prev is None or (k.is_closed and not prev.is_closed):
                     by_start[k.start_ms] = k
+
+        def next_after(start: int) -> int:
+            return period_end_ms(start, interval) if fixed_step_ms is None else start + fixed_step_ms
+
+        while True:
+            batch, srv_ms = self.fetch_kline_page(
+                symbol, category, interval, start_ms=cursor, end_ms=None, limit=page_size
+            )
+            pages += 1
+            if not batch:
+                break
+            merge(batch)
             last_start = batch[-1].start_ms
             if on_progress:
                 on_progress(pages, len(by_start), last_start)
-            next_cursor = (period_end_ms(last_start, interval) if fixed_step_ms is None
-                           else last_start + fixed_step_ms)
+            next_cursor = next_after(last_start)
+
             if end_ms is not None and next_cursor > end_ms:
                 break
+
+            step_est = fixed_step_ms or step_ms_approx(interval)
+            progressed = cursor is None or next_cursor > cursor
+            # Подозрение на границу архива: страница не продвигается ИЛИ неполная,
+            # хотя до конца запрошенного окна (или до серверного "сейчас") ещё далеко.
+            horizon_ms = end_ms if end_ms is not None else srv_ms
+            partial_far_from_end = (
+                len(batch) < page_size and horizon_ms
+                and (horizon_ms - next_cursor) > 12 * step_est
+            )
+            if (not progressed) or partial_far_from_end:
+                # Зондируем вперёд в поисках возобновления данных.
+                if recoveries >= max_recoveries:
+                    logger.warning("Лимит восстановлений пагинации исчерпан, останавливаюсь (cursor=%s)", cursor)
+                    break
+                recoveries += 1
+                new_cursor = None
+                for jump_ms in self._probe_jumps_ms(interval):
+                    if fixed_step_ms is not None:
+                        probe = next_cursor + jump_ms
+                    else:
+                        probe = next_cursor
+                        for _ in range(max(1, jump_ms // (30 * 86_400_000))):
+                            probe = period_end_ms(probe, interval)
+                    if end_ms is not None and probe > end_ms:
+                        break
+                    pbatch, _ = self.fetch_kline_page(
+                        symbol, category, interval, start_ms=probe, end_ms=None, limit=page_size
+                    )
+                    pages += 1
+                    if not pbatch:
+                        continue
+                    merge(pbatch)
+                    forward = [k for k in pbatch if k.start_ms >= probe]
+                    if on_progress:
+                        on_progress(pages, len(by_start), pbatch[-1].start_ms)
+                    if forward:
+                        resume_start = min(k.start_ms for k in forward)
+                        new_cursor = next_after(max(k.start_ms for k in forward))
+                        logger.warning(
+                            "Граница архива Bybit: данные до %s, возобновляются с %s. "
+                            "Отсутствующие бары НЕ заполняются (будут в отчёте пропусков).",
+                            last_start, resume_start)
+                        break
+                if new_cursor is None:
+                    logger.warning("Пагинация не продвигается далее %s и зондирование не нашло "
+                                   "продолжения - останавливаюсь", cursor)
+                    break
+                cursor = new_cursor
+                if end_ms is not None and cursor > end_ms:
+                    break
+                continue
+
             if len(batch) < page_size:
-                # сервер вернул меньше, чем просили -> данные до конца окна/истории исчерпаны
-                break
-            if cursor is not None and next_cursor <= cursor:
-                logger.warning("Пагинация не продвигается (next=%s <= cursor=%s), останавливаюсь", next_cursor, cursor)
+                # сервер вернул меньше, чем просили, рядом с концом окна -> данные исчерпаны
                 break
             if max_pages is not None and pages >= max_pages:
                 break
             cursor = next_cursor
 
         out = [by_start[s] for s in sorted(by_start)]
-        logger.info("fetch_klines: pages=%d unique=%d", pages, len(out))
+        logger.info("fetch_klines: pages=%d unique=%d recoveries=%d", pages, len(out), recoveries)
         return out
+
+    @staticmethod
+    def _probe_jumps_ms(interval: str) -> tuple[int, ...]:
+        """Шаги зондирования вперёд при серверном стопе пагинации (ms)."""
+        if interval in ("D", "W", "M"):
+            return (30 * 86_400_000, 90 * 86_400_000)  # для D/W/M: ~1 и ~3 месяца периодами
+        return (3_600_000, 6 * 3_600_000, 24 * 3_600_000,
+                3 * 24 * 3_600_000, 7 * 24 * 3_600_000,
+                14 * 24 * 3_600_000, 28 * 24 * 3_600_000)
 
     def describe(self) -> dict:
         return {"source": self.name, "rest_base_url": self.base_url, "api": "v5/market"}

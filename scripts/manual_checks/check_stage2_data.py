@@ -173,6 +173,70 @@ def check_a6_store_roundtrip() -> None:
            f"df_ok={ok_df}, meta_ok={ok_meta}, meta_keys={sorted(meta.keys())[:5]}...")
 
 
+# ---------------------------------------------------------------- offline A7
+def check_a7_archive_boundary_recovery() -> None:
+    """Офлайн-симуляция границы архива Bybit (эмпирически обнаружена 2026-10-22
+    на spot BTCUSDT 5m около 2022-04-11): страница со start у границы возвращает
+    данные, ЗАКАНЧИВАЮЩИЕСЯ ДО start (пагинация стопорится), архив имеет реальный
+    пропуск, данные возобновляются позже. Проверка: загрузчик восстанавливается
+    зондированием вперёд, склеивает сегменты, пропуск остаётся честным гэпом."""
+    from btc_bot.data_sources.base import Kline
+    from btc_bot.data_sources.bybit import BybitSource
+
+    STEP_L = 300_000
+    A = BASE
+    B = A + 149 * STEP_L          # последний бар старого сегмента
+    R = B + 1201 * STEP_L         # возобновление данных (гэп 1200 баров)
+    END = R + 40 * STEP_L
+    PAGE = 100
+
+    class BoundarySource(BybitSource):
+        def __init__(self):
+            super().__init__(min_request_interval_s=0.0)
+            self.calls = 0
+
+        def fetch_kline_page(self, symbol, category, interval, start_ms=None, end_ms=None, limit=PAGE):
+            self.calls += 1
+            if start_ms is None:
+                start_ms = A
+
+            def bar(t):
+                return Kline(t, 1.0, 2.0, 0.5, 1.5, 1.0, 1.5, True)
+
+            if start_ms <= B:
+                stops = list(range(start_ms, min(start_ms + limit * STEP_L, B + STEP_L), STEP_L))
+            elif start_ms < B + 2 * 86_400_000:
+                # чистый "старый хвост": страница заканчивается ДО start -> стоп пагинации
+                stops = list(range(B - (limit - 1) * STEP_L, B + STEP_L, STEP_L))
+            elif start_ms < R:
+                # смешанный ответ: хвост старого сегмента + bars нового (как реальный API)
+                old_tail = [B - i * STEP_L for i in range(4, -1, -1)]
+                new_seg = list(range(R, min(R + (limit - 5) * STEP_L, END + STEP_L), STEP_L))
+                stops = old_tail + new_seg
+            else:
+                stops = list(range(start_ms, min(start_ms + limit * STEP_L, END + STEP_L), STEP_L))
+            return [bar(t) for t in sorted(set(stops))], END + STEP_L
+
+    src = BoundarySource()
+    kl = src.fetch_klines("BTCUSDT", "spot", "5", start_ms=A, end_ms=END, limit=PAGE)
+    starts = [k.start_ms for k in kl]
+    expected = list(range(A, B + STEP_L, STEP_L)) + list(range(R, END + STEP_L, STEP_L))
+    ok_series = starts == sorted(set(expected)) and len(starts) == 150 + 41
+    ok_unique = len(set(starts)) == len(starts)
+    gap_bars = (R - B) // STEP_L - 1
+    ok_gap = all(b - a == STEP_L for a, b in zip(starts[:-1], starts[1:]) if a != B) and (B in starts and R in starts)
+    # clean_klines должен честно показать гэп
+    import pandas as pd
+    from btc_bot.data.store import klines_to_dataframe
+    df, rep = clean_klines(klines_to_dataframe(kl), "5")
+    ok_report = rep.total_missing_bars == gap_bars and len(rep.gaps) == 1 and rep.n_duplicates_removed == 0
+    ok_bounded = src.calls < 40
+    record("A7 граница архива: стоп пагинации -> зондирование -> склейка сегментов; пропуск 1200 баров остаётся честным гэпом",
+           ok_series and ok_unique and ok_gap and ok_report and ok_bounded,
+           f"bars={len(starts)} (ожидали {150 + 41}), gap={rep.total_missing_bars} (ожидали {gap_bars}), "
+           f"запросов={src.calls}, дубли={rep.n_duplicates_removed}")
+
+
 # ---------------------------------------------------------------- network B
 def _fetch_recent_days(source: BybitSource, symbol: str, days: int = 7):
     now_ms = source.get_server_time_ms()
@@ -295,6 +359,7 @@ def main() -> int:
     check_a4_invalid_ohlc()
     check_a5_targets()
     check_a6_store_roundtrip()
+    check_a7_archive_boundary_recovery()
 
     if args.no_network:
         print("-- Часть B: ПРОПУЩЕНА (--no-network). Сетевые проверки не выполнялись. --")

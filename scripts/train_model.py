@@ -90,8 +90,17 @@ def parse_args() -> argparse.Namespace:
 
 
 def find_latest_clean_csv(processed_dir: Path) -> Optional[Path]:
-    files = sorted(processed_dir.glob("*.clean.csv"))
-    return files[-1] if files else None
+    """Самый свежий clean-файл ПО ДАТЕ ЗАГРУЗКИ (fetched<UTC> в имени), а не по имени периода."""
+    import re
+    files = list(processed_dir.glob("*.clean.csv"))
+    if not files:
+        return None
+
+    def key(p: Path):
+        m = re.search(r"fetched(\d{8}T\d{6}Z)", p.name)
+        return (m.group(1) if m else "", p.stat().st_mtime, p.name)
+
+    return max(files, key=key)
 
 
 def fmt_ms(ms: int) -> str:
