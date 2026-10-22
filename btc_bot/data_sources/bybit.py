@@ -11,7 +11,12 @@
     по серверному времени ответа (поле time);
   * limit <= 1000; при заданном start сервер возвращает свечи вперёд от start;
   * IP-лимит 600 req / 5 s; при 403 "access too frequent" бан ~10 минут ->
-    троттлинг (min_request_interval) и backoff, 403 не ретраим агрессивно.
+    троттлинг (min_request_interval) и backoff, 403 не ретраим агрессивно;
+  * retCode 10016 ("internal error") - транзиентный сбой сервера Bybit:
+    ретраится с backoff наравне с rate-limit кодами (10006/10018);
+  * при фатальном сбое длительной загрузки уже собранные бары НЕ теряются:
+    исключение несёт атрибут partial_klines (сохранение/продолжение на стороне
+    вызывающего кода, см. scripts/download_history.py --resume).
 """
 
 from __future__ import annotations
@@ -26,6 +31,7 @@ import requests
 
 from .base import (
     DataSourceAPIError,
+    DataSourceError,
     DataSourceNetworkError,
     Kline,
     LastPrice,
@@ -42,6 +48,11 @@ INTERVAL_MS = {
 }
 
 MAX_LIMIT = 1000
+
+# retCode, которые имеют смысл "повтори позже" (транзиентные/лимиты):
+#   10006 - too many visits (rate limit), 10016 - internal error (сбой сервера),
+#   10018 - requests too frequent (rate limit)
+RETRYABLE_RETCODES = frozenset({10006, 10016, 10018})
 
 
 def interval_to_ms(interval: str) -> int:
@@ -79,6 +90,21 @@ def period_end_ms(start_ms: int, interval: str) -> int:
     else:  # M
         end = ts.normalize() + pd.offsets.MonthBegin(1)
     return int(end.timestamp() * 1000)
+
+
+def _reraise_with_partial(err: DataSourceError, by_start: dict[int, Kline], pages: int):
+    """Прикрепить уже собранные бары к фатальной ошибке и пробросить её дальше.
+
+    Позволяет загрузчику (download_history.py) сохранить частичный результат и
+    позже продолжить загрузку (--resume) вместо скачивания заново. Данные при
+    этом НЕ фабрикуются: прикрепляется только то, что реально вернул сервер.
+    """
+    try:
+        err.partial_klines = [by_start[s] for s in sorted(by_start)]
+        err.pages_fetched = pages
+    except Exception:  # noqa: BLE001 - атрибуты не прикреплены, ошибка важнее
+        pass
+    raise err
 
 
 class BybitSource(MarketDataSource):
@@ -144,11 +170,13 @@ class BybitSource(MarketDataSource):
                     ret_code = payload.get("retCode")
                     if ret_code == 0:
                         return payload
-                    if ret_code == 10006:  # Too many visits -> backoff и повтор
+                    if ret_code in RETRYABLE_RETCODES:
+                        # rate limit / транзиентный сбой сервера -> backoff и повтор
                         last_err = DataSourceAPIError(
-                            f"Bybit retCode 10006: {payload.get('retMsg')}", code=10006
+                            f"Bybit retCode {ret_code}: {payload.get('retMsg')}", code=ret_code
                         )
-                        logger.warning("rate limited (10006), backing off")
+                        logger.warning("транзиентная ошибка Bybit retCode=%s (попытка %d/%d) - backoff и повтор",
+                                       ret_code, attempt + 1, self.max_retries + 1)
                     else:
                         raise DataSourceAPIError(
                             f"Bybit retCode {ret_code}: {payload.get('retMsg')}", code=ret_code
@@ -259,6 +287,10 @@ class BybitSource(MarketDataSource):
 
         Останов: next_start > end_ms / сервер не вернул новых данных до конца
         истории / зондирование не нашло продолжения / исчерпан max_pages.
+
+        Фатальная ошибка сети/API пробрасывается наверх, но к исключению
+        прикрепляются уже собранные бары (атрибут partial_klines, pages_fetched) -
+        прогресс длительной загрузки не теряется.
         """
         # для внутридневных интервалов шаг точный; для D/W/M - через period_end_ms (переменная длина)
         fixed_step_ms = None if interval in ("D", "W", "M") else interval_to_ms(interval)
@@ -282,9 +314,12 @@ class BybitSource(MarketDataSource):
             return period_end_ms(start, interval) if fixed_step_ms is None else start + fixed_step_ms
 
         while True:
-            batch, srv_ms = self.fetch_kline_page(
-                symbol, category, interval, start_ms=cursor, end_ms=None, limit=page_size
-            )
+            try:
+                batch, srv_ms = self.fetch_kline_page(
+                    symbol, category, interval, start_ms=cursor, end_ms=None, limit=page_size
+                )
+            except DataSourceError as e:
+                _reraise_with_partial(e, by_start, pages)
             pages += 1
             if not batch:
                 break
@@ -322,9 +357,12 @@ class BybitSource(MarketDataSource):
                             probe = period_end_ms(probe, interval)
                     if end_ms is not None and probe > end_ms:
                         break
-                    pbatch, _ = self.fetch_kline_page(
-                        symbol, category, interval, start_ms=probe, end_ms=None, limit=page_size
-                    )
+                    try:
+                        pbatch, _ = self.fetch_kline_page(
+                            symbol, category, interval, start_ms=probe, end_ms=None, limit=page_size
+                        )
+                    except DataSourceError as e:
+                        _reraise_with_partial(e, by_start, pages)
                     pages += 1
                     if not pbatch:
                         continue

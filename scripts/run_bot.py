@@ -68,17 +68,9 @@ def parse_args() -> argparse.Namespace:
 
 
 def find_replay_file(cfg) -> Optional[Path]:
-    """Самый свежий clean-файл ПО ДАТЕ ЗАГРУЗКИ (fetched<UTC> в имени)."""
-    import re
-    files = list(cfg.resolve(cfg.data.processed_dir).glob("*.clean.csv"))
-    if not files:
-        return None
-
-    def key(p: Path):
-        m = re.search(r"fetched(\d{8}T\d{6}Z)", p.name)
-        return (m.group(1) if m else "", p.stat().st_mtime, p.name)
-
-    return max(files, key=key)
+    """Самый свежий ПОЛНЫЙ clean-файл ПО ДАТЕ ЗАГРУЗКИ (частичные _PARTIAL пропускаются)."""
+    from btc_bot.data.finders import find_latest_clean_csv
+    return find_latest_clean_csv(cfg.resolve(cfg.data.processed_dir))
 
 
 def main() -> int:

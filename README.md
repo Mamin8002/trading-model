@@ -82,7 +82,7 @@ python scripts\position_cli.py list
 
 ```powershell
 python scripts\download_history.py [--start 2024-01-01] [--end 2026-06-30]
-python scripts\manual_checks\check_stage2_data.py     # ожидание: RESULT: PASS (10)
+python scripts\manual_checks\check_stage2_data.py     # ожидание: RESULT: PASS (12)
 ```
 
 Файлы: `data\raw\*.csv` + `*.metadata.json` (инструмент, категория, интервал, период,
@@ -107,6 +107,20 @@ python scripts\manual_checks\check_stage2_data.py     # ожидание: RESULT
 
 Обрыв загрузки раньше конца периода теперь всегда виден по строке «Покрытие» и
 предупреждению о последней свече (проверка A7 в `check_stage2_data.py`).
+
+**Надёжность долгой загрузки**: транзиентные ошибки Bybit (`retCode 10016`
+«internal error», `10006`/`10018` rate limit, HTTP 429/5xx, сетевые сбои)
+ретраятся автоматически с backoff (проверка A8). Если запросы всё же исчерпаны,
+уже скачанные бары **не теряются**: сохраняется частичный файл
+`data\raw\..._PARTIAL_fetched....csv` (в метаданных `complete: false`),
+и загрузку можно продолжить без повторного скачивания начала:
+
+```powershell
+python scripts\download_history.py --resume data\raw\bybit_..._PARTIAL_fetched....csv
+```
+
+Частичные файлы (`_PARTIAL`) никогда не выбираются автоматически для обучения
+или реплея — только полный датасет после успешного `--resume` (проверка A9).
 
 ## Модель (Этап 2b)
 
@@ -336,13 +350,13 @@ SL/TP в LIVE проверяются по тикам сделок (`paper.intrab
 
 | Команда | Что проверяет | Ожидание |
 |---|---|---|
-| `python scripts\manual_checks\check_stage2_data.py` | сбор/очистка/сохранение; восстановление на границе архива | `RESULT: PASS (10)` |
+| `python scripts\manual_checks\check_stage2_data.py` | сбор/очистка/сохранение; граница архива; ретраи 10016; частичное сохранение и --resume | `RESULT: PASS (12)` |
 | `python scripts\manual_checks\check_stage2_model.py` | обучение + walk-forward на воспроизводимом наборе | `RESULT: PASS (6)` |
 | `python scripts\manual_checks\check_stage3_stream.py [--live]` | поток, закрытие свечи, обрыв, stale, сигналы, UI-режимы | `RESULT: PASS (11/12)` |
 | `python scripts\manual_checks\check_stage4_positions.py` | журнал, позиции, сопровождение | `RESULT: PASS (11)` |
 | `python scripts\manual_checks\check_stage5a_model.py` | v2: утечки, горизонт 15 мин, симулятор, gate | `RESULT: PASS (9)` |
 | `python scripts\manual_checks\check_stage5b_paper.py` | intrabar/spikes + paper trading (офлайн) | `RESULT: PASS (10)` |
-| `python -m pytest tests -q` | unit-тесты (офлайн) | `48 passed` |
+| `python -m pytest tests -q` | unit-тесты (офлайн) | `56 passed` |
 
 Все сценарии работают без секретов и без торговых операций, печатают PASS/FAIL и
 завершаются с ненулевым кодом при ошибке.

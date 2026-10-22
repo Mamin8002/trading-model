@@ -45,7 +45,7 @@ python -m pip install -r requirements.txt
 Проверка установки (офлайн, ~20 с):
 
 ```powershell
-python -m pytest tests -q        # ожидание: 48 passed
+python -m pytest tests -q        # ожидание: 56 passed
 ```
 
 ### Структура проекта
@@ -165,7 +165,16 @@ journal:
 python scripts\download_history.py                          # от data.history_start (2024-01-01) до сейчас
 python scripts\download_history.py --start 2025-01-01       # свой период
 python scripts\download_history.py --end 2026-06-30         # период с концом
+python scripts\download_history.py --resume data\raw\bybit_..._PARTIAL_fetched....csv
+                                                            # продолжить прерванную загрузку
 ```
+
+Надёжность: транзиентные ошибки Bybit (`retCode 10016` «internal error»,
+`10006`/`10018` rate limit, HTTP 429/5xx, сетевые сбои) ретраятся с backoff.
+Если загрузка всё же прервалась, уже скачанные бары сохраняются в файл
+`*_PARTIAL_*.csv` (метаданные `complete: false`) — продолжайте командой
+`--resume` (точную команду скрипт напечатает сам). Частичные файлы не
+используются для обучения/реплея автоматически.
 
 Создаваемые файлы:
 - `data\raw\bybit_spot_BTCUSDT_5m_<период>_fetched<UTC>.csv` — сырые свечи
@@ -468,14 +477,14 @@ python scripts\position_cli.py --journal data\manual_checks\paper_demo.json pape
 
 | Команда | Что проверяет | Ожидание |
 |---|---|---|
-| `python scripts\manual_checks\check_stage2_data.py` | сбор/очистка/сохранение; граница архива (частично сеть) | `RESULT: PASS (10)` |
+| `python scripts\manual_checks\check_stage2_data.py` | сбор/очистка/сохранение; граница архива; ретраи 10016; --resume (частично сеть) | `RESULT: PASS (12)` |
 | `python scripts\manual_checks\check_stage2_model.py` | обучение + walk-forward (офлайн) | `RESULT: PASS (6)` |
 | `python scripts\manual_checks\check_stage3_stream.py` | поток/свечи/обрыв/stale/UI-режимы (офлайн) | `RESULT: PASS (11)` |
 | `python scripts\manual_checks\check_stage3_stream.py --live` | + реальный WS Bybit (read-only) | `RESULT: PASS (12)` |
 | `python scripts\manual_checks\check_stage4_positions.py` | журнал/позиции/сопровождение (офлайн) | `RESULT: PASS (11)` |
 | `python scripts\manual_checks\check_stage5a_model.py` | v2: утечки, горизонт 15 мин, симулятор, adopt-gate (офлайн) | `RESULT: PASS (9)` |
 | `python scripts\manual_checks\check_stage5b_paper.py` | intrabar/spikes + paper trading (офлайн) | `RESULT: PASS (10)` |
-| `python -m pytest tests -q` | unit-тесты | `48 passed` |
+| `python -m pytest tests -q` | unit-тесты | `56 passed` |
 
 Любой сценарий завершается с ненулевым кодом при FAIL — можно встраивать в CI/планировщик.
 
@@ -532,6 +541,7 @@ python scripts\position_cli.py --journal data\manual_checks\paper_demo.json pape
 | `Артефакт модели не соответствует конфигурации` | Изменили symbol/interval/horizon без переобучения → `train_model.py` (или верните конфиг) |
 | `Clean-данные не найдены` (train/replay) | Не скачана история → `python scripts\download_history.py` |
 | HTTP 403 от Bybit при загрузке | Превышен IP-лимит; подождите ~10 минут, повторите |
+| `Bybit retCode 10016: internal error` при загрузке | Транзиентный сбой сервера Bybit: клиент ретраит сам; если загрузка всё же прервана — часть баров сохранена в `*_PARTIAL_*.csv`, продолжите `python scripts\download_history.py --resume <этот файл>` |
 | `RECONNECTING` в дашборде | Обрыв сети/прокси; бот переподключится сам и догрузит пропущенные свечи; сигналы в этот период помечаются неактуальными |
 | `STALE` длительное время | Нет обновлений >15 мин: проверьте сеть/региональную доступность `stream.bybit.com` |
 | Дашборд «множится» в терминале | Включите режим строки: `--ui line` (по умолчанию в средах без ANSI `auto` сам выберет `line`); `--ui dash` — только в терминалах с полноценным VT (Windows Terminal) |

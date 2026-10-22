@@ -90,17 +90,9 @@ def parse_args() -> argparse.Namespace:
 
 
 def find_latest_clean_csv(processed_dir: Path) -> Optional[Path]:
-    """Самый свежий clean-файл ПО ДАТЕ ЗАГРУЗКИ (fetched<UTC> в имени), а не по имени периода."""
-    import re
-    files = list(processed_dir.glob("*.clean.csv"))
-    if not files:
-        return None
-
-    def key(p: Path):
-        m = re.search(r"fetched(\d{8}T\d{6}Z)", p.name)
-        return (m.group(1) if m else "", p.stat().st_mtime, p.name)
-
-    return max(files, key=key)
+    """Самый свежий ПОЛНЫЙ clean-файл по дате загрузки (частичные _PARTIAL пропускаются)."""
+    from btc_bot.data.finders import find_latest_clean_csv as _find
+    return _find(processed_dir)
 
 
 def fmt_ms(ms: int) -> str:
@@ -174,7 +166,12 @@ def main() -> int:
     # -- данные ------------------------------------------------------------
     data_path = Path(args.data) if args.data else find_latest_clean_csv(cfg.resolve(cfg.data.processed_dir))
     if data_path is None or not data_path.exists():
-        log.error("Clean-данные не найдены. Сначала выполните: python scripts/download_history.py")
+        proc_dir = cfg.resolve(cfg.data.processed_dir)
+        if list(proc_dir.glob("*_PARTIAL*.clean.csv")):
+            log.error("Найдены только ЧАСТИЧНЫЕ файлы (загрузка прервана). Продолжите загрузку: "
+                      "python scripts/download_history.py --resume <файл data/raw/*_PARTIAL_*.csv>")
+        else:
+            log.error("Clean-данные не найдены. Сначала выполните: python scripts/download_history.py")
         return 2
     log.info("Данные: %s", data_path)
 

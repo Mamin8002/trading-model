@@ -25,6 +25,7 @@ import sys
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
@@ -237,6 +238,197 @@ def check_a7_archive_boundary_recovery() -> None:
            f"запросов={src.calls}, дубли={rep.n_duplicates_removed}")
 
 
+# ---------------------------------------------------------------- offline A8
+class _FakeResponse:
+    def __init__(self, payload: dict, status_code: int = 200):
+        self.status_code = status_code
+        self.text = json.dumps(payload)
+        self._payload = payload
+
+    def json(self) -> dict:
+        return self._payload
+
+
+def check_a8_retry_transient_10016() -> None:
+    """Bybit retCode 10016 ('internal error') - транзиентный сбой сервера
+    (наблюдался вживую 2026-10-22 на ~325-й странице загрузки). Клиент обязан
+    ретраить его с backoff, как 10006, а при исчерпании ретраев - не терять
+    уже собранные бары (проверяется в A9)."""
+    from unittest import mock
+
+    import btc_bot.data_sources.bybit as bybit_mod
+
+    STEP_L = 300_000
+    START = BASE
+    N = 250
+    END = START + (N - 1) * STEP_L
+    SRV = END + STEP_L
+
+    class FlakySession:
+        """Фейковая requests.Session: первые fail_times ответов - retCode 10016."""
+
+        def __init__(self, fail_times: int):
+            self.fail_left = fail_times
+            self.headers: dict = {}
+            self.calls = 0
+
+        def get(self, url, params=None, timeout=None):
+            self.calls += 1
+            if self.fail_left > 0:
+                self.fail_left -= 1
+                return _FakeResponse({"retCode": 10016, "retMsg": "internal error",
+                                      "result": None, "time": str(SRV)})
+            start = int(params.get("start", START))
+            limit = int(params.get("limit", 100))
+            bars = [t for t in range(max(start, START), END + STEP_L, STEP_L)][:limit]
+            rows = [[str(t), "1.0", "2.0", "0.5", "1.5", "1.0", "1.5"]
+                    for t in sorted(bars, reverse=True)]  # ответ по убыванию, как у Bybit
+            return _FakeResponse({"retCode": 0, "retMsg": "OK", "time": str(SRV),
+                                  "result": {"list": rows}})
+
+    # 1) два сбоя 10016 подряд -> backoff и успешное завершение загрузки
+    sess = FlakySession(fail_times=2)
+    src = BybitSource(base_url="https://fake.local", min_request_interval_s=0.0,
+                      max_retries=5, session=sess)
+    with mock.patch.object(bybit_mod.time, "sleep") as fake_sleep:
+        kl = src.fetch_klines("BTCUSDT", "spot", "5", start_ms=START, end_ms=END, limit=100)
+    ok_retry = (len(kl) == N and fake_sleep.call_count >= 2
+                and [k.start_ms for k in kl] == list(range(START, END + STEP_L, STEP_L)))
+
+    # 2) перманентный 10016 -> ошибка пробрасывается после исчерпания ретраев (не виснет)
+    from btc_bot.data_sources.base import DataSourceAPIError
+    sess2 = FlakySession(fail_times=99)
+    src2 = BybitSource(base_url="https://fake.local", min_request_interval_s=0.0,
+                       max_retries=2, session=sess2)
+    raised = None
+    with mock.patch.object(bybit_mod.time, "sleep"):
+        try:
+            src2.fetch_klines("BTCUSDT", "spot", "5", start_ms=START, end_ms=END, limit=100)
+        except DataSourceAPIError as e:
+            raised = e
+    ok_fatal = raised is not None and raised.code == 10016 and sess2.calls == 3
+
+    record("A8 транзиентный retCode 10016: backoff+ретрай до успеха; при исчерпании ретраев - ошибка",
+           ok_retry and ok_fatal,
+           f"после 2 сбоев загружено={len(kl)}/{N}, backoff вызван {fake_sleep.call_count} раз(а); "
+           f"перманентный сбой: code={getattr(raised, 'code', None)}, попыток={sess2.calls}")
+
+
+# ---------------------------------------------------------------- offline A9
+def check_a9_partial_save_and_resume() -> None:
+    """Фатальный сбой на середине загрузки: уже собранные бары прикрепляются к
+    ошибке (partial_klines), сохраняются как _PARTIAL-файлы и загрузка
+    продолжается через --resume (склейка без потерь и дублей, закрытая версия
+    бара предпочтительнее незакрытой)."""
+    SCRIPTS_DIR = PROJECT_ROOT / "scripts"
+    if str(SCRIPTS_DIR) not in sys.path:
+        sys.path.insert(0, str(SCRIPTS_DIR))
+    import download_history as dh  # noqa: PLC0415
+
+    from btc_bot.data.finders import find_latest_clean_csv
+    from btc_bot.data.store import dedupe_klines, klines_to_dataframe
+    from btc_bot.data_sources.base import DataSourceAPIError
+
+    STEP_L = 300_000
+    START = BASE
+    N = 250
+    END = START + (N - 1) * STEP_L
+    PAGE = 100
+    FAIL_FROM = START + 200 * STEP_L
+
+    def bar(t: int, closed: bool = True) -> Kline:
+        return Kline(t, 1.0, 2.0, 0.5, 1.5, 1.0, 1.5, closed)
+
+    class FatalAfterNSource(BybitSource):
+        """Первые страницы нормальные, с FAIL_FROM - перманентный 10016."""
+
+        def __init__(self):
+            super().__init__(min_request_interval_s=0.0)
+
+        def fetch_kline_page(self, symbol, category, interval, start_ms=None, end_ms=None, limit=PAGE):
+            start = start_ms if start_ms is not None else START
+            if start >= FAIL_FROM:
+                raise DataSourceAPIError("Bybit retCode 10016: internal error", code=10016)
+            bars = [bar(t) for t in range(start, min(start + limit * STEP_L, FAIL_FROM), STEP_L)]
+            return bars, END + STEP_L
+
+    class HealthySource(BybitSource):
+        def __init__(self):
+            super().__init__(min_request_interval_s=0.0)
+
+        def fetch_kline_page(self, symbol, category, interval, start_ms=None, end_ms=None, limit=PAGE):
+            start = start_ms if start_ms is not None else START
+            bars = [bar(t) for t in range(start, min(start + limit * STEP_L, END + STEP_L), STEP_L)]
+            return bars, END + STEP_L
+
+    problems: list[str] = []
+    n_final: Optional[int] = None
+    with tempfile.TemporaryDirectory() as td:
+        raw_dir, proc_dir = Path(td) / "raw", Path(td) / "proc"
+        base_name = dh.make_base_name("spot", "BTCUSDT", "5", START, END)
+
+        # 1) фатальный сбой -> исключение несёт partial_klines
+        try:
+            FatalAfterNSource().fetch_klines("BTCUSDT", "spot", "5",
+                                             start_ms=START, end_ms=END, limit=PAGE)
+            problems.append("ошибка не выброшена")
+            err = None
+        except DataSourceAPIError as e:
+            err = e
+        if err is not None and len(getattr(err, "partial_klines", [])) != 200:
+            problems.append(f"partial_klines={len(getattr(err, 'partial_klines', []))} (ожидали 200)")
+
+        # 2) сохранение частичного файла (как делает download_history при сбое)
+        saved = dh.save_partial_and_report_error(
+            err, [], base_name, raw_dir, proc_dir,
+            category="spot", symbol="BTCUSDT", interval="5",
+            requested_start_ms=START, requested_end_ms=END,
+        )
+        if saved is None or "_PARTIAL" not in saved.name:
+            problems.append(f"частичный файл не сохранён: {saved}")
+        else:
+            meta = json.loads(saved.with_suffix(".csv.metadata.json").read_text(encoding="utf-8"))
+            if meta.get("complete") is not False or meta.get("requested_start_ms") != START:
+                problems.append(f"metadata частичного файла некорректна: complete={meta.get('complete')}")
+            # частичный файл НЕ должен выбираться для обучения автоматически
+            if find_latest_clean_csv(proc_dir) is not None:
+                problems.append("find_latest_clean_csv выбрал _PARTIAL-файл")
+
+            # 3) resume: загрузка partial + докачка остатка + склейка
+            part_kl, part_meta = dh.load_partial_for_resume(saved)
+            resume_start = period_end_ms(part_kl[-1].start_ms, "5")
+            if resume_start != FAIL_FROM or part_meta.get("requested_end_ms") != END:
+                problems.append(f"resume_start/meta некорректны: {resume_start}")
+            rest = HealthySource().fetch_klines("BTCUSDT", "spot", "5",
+                                                start_ms=resume_start, end_ms=END, limit=PAGE)
+            merged = dedupe_klines(part_kl + rest)
+            df, rep = clean_klines(klines_to_dataframe(merged), "5")
+            n_final = rep.n_output
+            if rep.n_output != N or rep.total_missing_bars != 0 or rep.n_duplicates_removed != 0:
+                problems.append(f"склейка неполная: n={rep.n_output}/{N}, gaps={rep.total_missing_bars}")
+
+            # 4) полная склейка сохраняется как обычный (не PARTIAL) датасет и выбирается finder'ом
+            full_base = dh.make_base_name("spot", "BTCUSDT", "5", START, END)
+            dh.persist_outputs(merged, full_base, raw_dir, proc_dir,
+                               category="spot", symbol="BTCUSDT", interval="5",
+                               extra_meta={"resumed_from": saved.name}, complete=True)
+            latest = find_latest_clean_csv(proc_dir)
+            if latest is None or "_PARTIAL" in latest.name:
+                problems.append(f"finder не выбрал полный файл: {latest}")
+
+        # 5) незакрытая свеча в partial не должна 'перекрывать' закрытую при склейке
+        old_unclosed = [bar(START, closed=False), bar(START + STEP_L)]
+        new_closed = [bar(START), bar(START + STEP_L), bar(START + 2 * STEP_L)]
+        m2 = dedupe_klines(old_unclosed + new_closed)
+        df2, rep2 = clean_klines(klines_to_dataframe(m2), "5")
+        if rep2.n_output != 3:
+            problems.append(f"дедупликация потеряла закрытый бар: n_output={rep2.n_output} (ожидали 3)")
+
+    record("A9 фатальный сбой: partial_klines -> _PARTIAL-файл -> --resume склейка без потерь; finder пропускает частичные",
+           not problems, "; ".join(problems) if problems else
+           f"partial=200 баров, итог после resume={n_final}/{N}")
+
+
 # ---------------------------------------------------------------- network B
 def _fetch_recent_days(source: BybitSource, symbol: str, days: int = 7):
     now_ms = source.get_server_time_ms()
@@ -360,6 +552,8 @@ def main() -> int:
     check_a5_targets()
     check_a6_store_roundtrip()
     check_a7_archive_boundary_recovery()
+    check_a8_retry_transient_10016()
+    check_a9_partial_save_and_resume()
 
     if args.no_network:
         print("-- Часть B: ПРОПУЩЕНА (--no-network). Сетевые проверки не выполнялись. --")
